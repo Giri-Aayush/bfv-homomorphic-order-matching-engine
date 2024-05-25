@@ -13,13 +13,20 @@ struct Orders {
 }
 
 fn main() {
-
+    println!("================================================");
+    println!("         Order Matching Process");
+    println!("================================================");
 
     // plaintext modulus
     let t = 65537;
 
     // no of slots
     let slots = 1 << 4;
+
+    println!("Initializing parameters:");
+    println!("- Plaintext modulus: {}", t);
+    println!("- Number of slots: {}", slots);
+    println!("------------------------------------------------");
 
     let mut rng = thread_rng();
 
@@ -28,30 +35,46 @@ fn main() {
     // P - 180 bits
     params.enable_hybrid_key_switching(&[60; 3]);
 
-
+    println!("Generating secret key...");
     let sk = SecretKey::random_with_params(&params, &mut rng);
+    println!("Secret key generated.");
+    println!("------------------------------------------------");
 
+    println!("Creating evaluator...");
     let evaluator = Evaluator::new(params);
+    println!("Evaluator created.");
+    println!("------------------------------------------------");
 
+    println!("Generating evaluation key...");
     let ek = EvaluationKey::new(evaluator.params(), &sk, &[0], &[0], &[1], &mut rng);
+    println!("Evaluation key generated.");
+    println!("------------------------------------------------");
 
-
+    println!("Opening and reading the order file...");
     let file_path = "order.json";
     let mut file = File::open(file_path).expect("File not found");
 
     let mut contents = String::new();
     file.read_to_string(&mut contents)
         .expect("Failed to read file");
+    println!("Order file read successfully.");
+    println!("------------------------------------------------");
 
+    println!("Parsing JSON data...");
     let order_data: Orders = serde_json::from_str(&contents).expect("Failed to parse JSON");
+    println!("JSON data parsed.");
+    println!("------------------------------------------------");
 
-
+    println!("Extracting buy and sell orders...");
     let buy_orders_plain = order_data.buy_orders;
     let sell_orders_plain = order_data.sell_orders;
+    println!("Buy orders (plain): {:?}", buy_orders_plain);
+    println!("Sell orders (plain): {:?}", sell_orders_plain);
+    println!("------------------------------------------------");
 
     let order_len = buy_orders_plain.len();
 
-
+    println!("Formatting buy orders for encoding...");
     let buy_orders_formatted_plain = buy_orders_plain
         .iter()
         .map(|x| {
@@ -60,7 +83,10 @@ fn main() {
             val
         })
         .collect::<Vec<Vec<u64>>>();
+    println!("Buy orders formatted for encoding.");
+    println!("------------------------------------------------");
 
+    println!("Formatting sell orders for encoding...");
     let sell_orders_formatted_plain = sell_orders_plain
         .iter()
         .map(|x| {
@@ -69,18 +95,26 @@ fn main() {
             val
         })
         .collect::<Vec<Vec<u64>>>();
+    println!("Sell orders formatted for encoding.");
+    println!("------------------------------------------------");
 
-
+    println!("Encoding buy orders...");
     let encoded_buy_orders: Vec<Plaintext> = buy_orders_formatted_plain
         .iter()
         .map(|x| evaluator.plaintext_encode(&x, Encoding::default()))
         .collect::<Vec<Plaintext>>();
+    println!("Buy orders encoded.");
+    println!("------------------------------------------------");
 
+    println!("Encoding sell orders...");
     let encoded_sell_orders: Vec<Plaintext> = sell_orders_formatted_plain
         .iter()
         .map(|x| evaluator.plaintext_encode(&x, Encoding::default()))
         .collect::<Vec<Plaintext>>();
+    println!("Sell orders encoded.");
+    println!("------------------------------------------------");
 
+    println!("Encrypting buy orders...");
     let encrypted_buy_orders: Vec<Ciphertext> = encoded_buy_orders
         .iter()
         .map(|x| evaluator.encrypt(&sk, &x, &mut rng))
@@ -90,7 +124,9 @@ fn main() {
     for ct in &encrypted_buy_orders {
         println!("{:?}", ct);
     }
+    println!("------------------------------------------------");
 
+    println!("Encrypting sell orders...");
     let encrypted_sell_orders: Vec<Ciphertext> = encoded_sell_orders
         .iter()
         .map(|x| evaluator.encrypt(&sk, &x, &mut rng))
@@ -100,7 +136,9 @@ fn main() {
     for ct in &encrypted_sell_orders {
         println!("{:?}", ct);
     }
+    println!("------------------------------------------------");
 
+    println!("Summing up buy order values (encrypted)...");
     let sum_buy_orders = encrypted_buy_orders
         .iter()
         .skip(1)
@@ -109,7 +147,10 @@ fn main() {
             println!("Intermediate sum (encrypted): {:?}", sum);
             sum
         });
+    println!("Sum of buy orders (encrypted): {:?}", sum_buy_orders);
+    println!("------------------------------------------------");
 
+    println!("Summing up sell order values (encrypted)...");
     let sum_sell_orders = encrypted_sell_orders
         .iter()
         .skip(1)
@@ -118,18 +159,24 @@ fn main() {
             println!("Intermediate sum (encrypted): {:?}", sum);
             sum
         });
+    println!("Sum of sell orders (encrypted): {:?}", sum_sell_orders);
+    println!("------------------------------------------------");
 
-
+    println!("Comparing sum of buy orders and sell orders (encrypted)...");
     let is_buy_sum_less_encrypted =
         univariate_less_than(&evaluator, &sum_buy_orders, &sum_sell_orders, &ek, &sk);
     println!("Comparison result (encrypted): {:?}", is_buy_sum_less_encrypted);
+    println!("------------------------------------------------");
 
+    println!("Decrypting the comparison result...");
     let is_buy_sum_less_plain = evaluator.plaintext_decode(
         &evaluator.decrypt(&sk, &is_buy_sum_less_encrypted),
         Encoding::default(),
     );
+    println!("Comparison result (decrypted): {:?}", is_buy_sum_less_plain);
+    println!("------------------------------------------------");
 
-   
+    println!("Determining transaction volume...");
     match is_buy_sum_less_plain[0] {
         0 => {
             println!("Sum of buy orders is greater than or equal to sum of sell orders.");
@@ -149,7 +196,7 @@ fn main() {
         }
         _ => println!("This condition is not possible!!"),
     }
-    
+    println!("------------------------------------------------");
 
     let mut sum_sell_orders_temp = sum_sell_orders.clone();
     let mut sum_buy_orders_temp = sum_buy_orders.clone();
@@ -167,6 +214,7 @@ fn main() {
             &evaluator.decrypt(&sk, &is_less_encrypted),
             Encoding::default(),
         );
+        println!("Is buy order less than remaining sell orders (decrypted): {:?}", is_less_plain);
 
         match is_less_plain[0] {
             0 => {
@@ -184,6 +232,7 @@ fn main() {
             }
             _ => println!("This condition is not possible!!"),
         }
+        println!("------------------------------------------------");
     }
 
     println!("Filling sell orders...");
@@ -196,6 +245,7 @@ fn main() {
             &evaluator.decrypt(&sk, &is_less_encrypted),
             Encoding::default(),
         );
+        println!("Is sell order less than remaining buy orders (decrypted): {:?}", is_less_plain);
 
         match is_less_plain[0] {
             0 => {
@@ -213,8 +263,10 @@ fn main() {
             }
             _ => println!("This condition is not possible!!"),
         }
+        println!("------------------------------------------------");
     }
 
+    println!("Decrypting and decoding filled buy orders...");
     let buy_orders_filled_plain = buy_orders_filling_encrypted
         .iter()
         .map(|x| evaluator.plaintext_decode(&evaluator.decrypt(&sk, &x), Encoding::default())[0])
@@ -223,7 +275,9 @@ fn main() {
     for (index, &order) in buy_orders_filled_plain.iter().enumerate() {
         println!("Buy Order #{}: {}", index + 1, order);
     }
+    println!("------------------------------------------------");
 
+    println!("Decrypting and decoding filled sell orders...");
     let sell_orders_filled_plain = sell_orders_filling_encrypted
         .iter()
         .map(|x| evaluator.plaintext_decode(&evaluator.decrypt(&sk, &x), Encoding::default())[0])
@@ -232,4 +286,8 @@ fn main() {
     for (index, &order) in sell_orders_filled_plain.iter().enumerate() {
         println!("Sell Order #{}: {}", index + 1, order);
     }
+    println!("------------------------------------------------");
+
+    println!("Order matching process completed.");
+    println!("Buy/Sell orders which could be filled are mentioned with their order value, rest which can't be filled are mentioned with value 0.");
 }
