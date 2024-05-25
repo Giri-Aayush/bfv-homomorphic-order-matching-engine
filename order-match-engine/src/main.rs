@@ -81,4 +81,51 @@ fn main() {
         .map(|x| evaluator.plaintext_encode(&x, Encoding::default()))
         .collect::<Vec<Plaintext>>();
 
+    let encrypted_buy_orders: Vec<Ciphertext> = encoded_buy_orders
+        .iter()
+        .map(|x| evaluator.encrypt(&sk, &x, &mut rng))
+        .collect::<Vec<Ciphertext>>();
+    println!("Buy orders encrypted.");
+    println!("Encrypted buy orders:");
+    for ct in &encrypted_buy_orders {
+        println!("{:?}", ct);
+    }
+
+    let encrypted_sell_orders: Vec<Ciphertext> = encoded_sell_orders
+        .iter()
+        .map(|x| evaluator.encrypt(&sk, &x, &mut rng))
+        .collect::<Vec<Ciphertext>>();
+    println!("Sell orders encrypted.");
+    println!("Encrypted sell orders:");
+    for ct in &encrypted_sell_orders {
+        println!("{:?}", ct);
+    }
+
+    let sum_buy_orders = encrypted_buy_orders
+        .iter()
+        .skip(1)
+        .fold(encrypted_buy_orders[0].clone(), |acc, x| {
+            let sum = evaluator.add(&acc, &x);
+            println!("Intermediate sum (encrypted): {:?}", sum);
+            sum
+        });
+
+    let sum_sell_orders = encrypted_sell_orders
+        .iter()
+        .skip(1)
+        .fold(encrypted_sell_orders[0].clone(), |acc, x| {
+            let sum = evaluator.add(&acc, &x);
+            println!("Intermediate sum (encrypted): {:?}", sum);
+            sum
+        });
+
+
+    let is_buy_sum_less_encrypted =
+        univariate_less_than(&evaluator, &sum_buy_orders, &sum_sell_orders, &ek, &sk);
+    println!("Comparison result (encrypted): {:?}", is_buy_sum_less_encrypted);
+
+    let is_buy_sum_less_plain = evaluator.plaintext_decode(
+        &evaluator.decrypt(&sk, &is_buy_sum_less_encrypted),
+        Encoding::default(),
+    );
 }
