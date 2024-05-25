@@ -150,4 +150,69 @@ fn main() {
         _ => println!("This condition is not possible!!"),
     }
     
+
+    let mut sum_sell_orders_temp = sum_sell_orders.clone();
+    let mut sum_buy_orders_temp = sum_buy_orders.clone();
+
+    let mut buy_orders_filling_encrypted: Vec<Ciphertext> = vec![];
+    let mut sell_orders_filling_encrypted: Vec<Ciphertext> = vec![];
+
+    println!("Filling buy orders...");
+    for (index, order) in encrypted_buy_orders.iter().enumerate() {
+        println!("Processing Buy Order #{}", index + 1);
+        let is_less_encrypted =
+            univariate_less_than(&evaluator, order, &sum_sell_orders_temp, &ek, &sk);
+        println!("Is buy order less than remaining sell orders (encrypted): {:?}", is_less_encrypted);
+        let is_less_plain = evaluator.plaintext_decode(
+            &evaluator.decrypt(&sk, &is_less_encrypted),
+            Encoding::default(),
+        );
+
+        match is_less_plain[0] {
+            0 => {
+                println!("Buy Order #{} cannot be filled.", index + 1);
+                let zero_value_order = vec![0; slots];
+                let zero_value_order_encoded = evaluator.plaintext_encode(&zero_value_order, Encoding::default());
+                let zero_value_order_encrypted = evaluator.encrypt(&sk, &zero_value_order_encoded, &mut rng);
+                buy_orders_filling_encrypted.push(zero_value_order_encrypted);
+            }
+            1 => {
+                println!("Buy Order #{} filled.", index + 1);
+                sum_sell_orders_temp = evaluator.sub(&sum_sell_orders_temp, order);
+                println!("Remaining sell orders (encrypted): {:?}", sum_sell_orders_temp);
+                buy_orders_filling_encrypted.push(order.clone());
+            }
+            _ => println!("This condition is not possible!!"),
+        }
+    }
+
+    println!("Filling sell orders...");
+    for (index, order) in encrypted_sell_orders.iter().enumerate() {
+        println!("Processing Sell Order #{}", index + 1);
+        let is_less_encrypted =
+            univariate_less_than(&evaluator, order, &sum_buy_orders_temp, &ek, &sk);
+        println!("Is sell order less than remaining buy orders (encrypted): {:?}", is_less_encrypted);
+        let is_less_plain = evaluator.plaintext_decode(
+            &evaluator.decrypt(&sk, &is_less_encrypted),
+            Encoding::default(),
+        );
+
+        match is_less_plain[0] {
+            0 => {
+                println!("Sell Order #{} cannot be filled.", index + 1);
+                let zero_value_order = vec![0; slots];
+                let zero_value_order_encoded = evaluator.plaintext_encode(&zero_value_order, Encoding::default());
+                let zero_value_order_encrypted = evaluator.encrypt(&sk, &zero_value_order_encoded, &mut rng);
+                sell_orders_filling_encrypted.push(zero_value_order_encrypted);
+            }
+            1 => {
+                println!("Sell Order #{} filled.", index + 1);
+                sum_buy_orders_temp = evaluator.sub(&sum_buy_orders_temp, order);
+                println!("Remaining buy orders (encrypted): {:?}", sum_buy_orders_temp);
+                sell_orders_filling_encrypted.push(order.clone());
+            }
+            _ => println!("This condition is not possible!!"),
+        }
+    }
+
 }
