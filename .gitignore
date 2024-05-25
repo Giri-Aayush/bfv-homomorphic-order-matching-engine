@@ -52,6 +52,7 @@ build/
 /src/tools/x/target
 /bfv/target
 /caird/operators/target
+/order-match-engine/target
 # Created by default with `src/ci/docker/run.sh`
 /obj/
 
