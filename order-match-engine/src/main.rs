@@ -128,4 +128,26 @@ fn main() {
         &evaluator.decrypt(&sk, &is_buy_sum_less_encrypted),
         Encoding::default(),
     );
+
+   
+    match is_buy_sum_less_plain[0] {
+        0 => {
+            println!("Sum of buy orders is greater than or equal to sum of sell orders.");
+            let transaction_volume = evaluator.plaintext_decode(
+                &evaluator.decrypt(&sk, &sum_buy_orders),
+                Encoding::default(),
+            );
+            println!("Transaction Volume: {:?}", transaction_volume[0]);
+        }
+        1 => {
+            println!("Sum of buy orders is less than sum of sell orders.");
+            let transaction_volume = evaluator.plaintext_decode(
+                &evaluator.decrypt(&sk, &sum_sell_orders),
+                Encoding::default(),
+            );
+            println!("Transaction Volume: {:?}", transaction_volume[0]);
+        }
+        _ => println!("This condition is not possible!!"),
+    }
+    
 }
