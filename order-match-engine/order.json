@@ -1,5 +1,5 @@
 {
   "pair": "USDC/USDT",
-  "buy_orders": [6, 6, 6, 400, 6, 6],
-  "sell_orders": [1, 2, 3, 4, 5, 500]
+  "buy_orders": [6, 6, 6, 6, 6, 6],
+  "sell_orders": [1, 2, 3, 4, 5, 6]
 }
