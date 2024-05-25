@@ -51,5 +51,34 @@ fn main() {
 
     let order_len = buy_orders_plain.len();
 
-    
+
+    let buy_orders_formatted_plain = buy_orders_plain
+        .iter()
+        .map(|x| {
+            let mut val = vec![0; slots];
+            val[0] = *x;
+            val
+        })
+        .collect::<Vec<Vec<u64>>>();
+
+    let sell_orders_formatted_plain = sell_orders_plain
+        .iter()
+        .map(|x| {
+            let mut val = vec![0; slots];
+            val[0] = *x;
+            val
+        })
+        .collect::<Vec<Vec<u64>>>();
+
+
+    let encoded_buy_orders: Vec<Plaintext> = buy_orders_formatted_plain
+        .iter()
+        .map(|x| evaluator.plaintext_encode(&x, Encoding::default()))
+        .collect::<Vec<Plaintext>>();
+
+    let encoded_sell_orders: Vec<Plaintext> = sell_orders_formatted_plain
+        .iter()
+        .map(|x| evaluator.plaintext_encode(&x, Encoding::default()))
+        .collect::<Vec<Plaintext>>();
+
 }
