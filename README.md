@@ -20,6 +20,9 @@ Here's a sample output of the BFV Homomorphic Order Matching Engine:
 
 In this example, the engine successfully matches the buy and sell orders while keeping the order values encrypted during the process. The filled orders are decrypted and displayed at the end, showing which orders were matched and their corresponding values.
 
+## Flow-Chart
+![alt text](image.png)
+
 ## Getting Started
 To run the BFV Homomorphic Order Matching Engine, follow these steps:
 
