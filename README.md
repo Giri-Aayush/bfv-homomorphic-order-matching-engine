@@ -50,6 +50,7 @@ To run the BFV Homomorphic Order Matching Engine, follow these steps:
 
 9. **Run the engine**:
     ```sh
+    cd bfv-homomorphic-order-matching-engine/order-match-engine
     cargo run
     ```
 
