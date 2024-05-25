@@ -215,4 +215,21 @@ fn main() {
         }
     }
 
+    let buy_orders_filled_plain = buy_orders_filling_encrypted
+        .iter()
+        .map(|x| evaluator.plaintext_decode(&evaluator.decrypt(&sk, &x), Encoding::default())[0])
+        .collect::<Vec<u64>>();
+    println!("Filled buy orders (decrypted):");
+    for (index, &order) in buy_orders_filled_plain.iter().enumerate() {
+        println!("Buy Order #{}: {}", index + 1, order);
+    }
+
+    let sell_orders_filled_plain = sell_orders_filling_encrypted
+        .iter()
+        .map(|x| evaluator.plaintext_decode(&evaluator.decrypt(&sk, &x), Encoding::default())[0])
+        .collect::<Vec<u64>>();
+    println!("Filled sell orders (decrypted):");
+    for (index, &order) in sell_orders_filled_plain.iter().enumerate() {
+        println!("Sell Order #{}: {}", index + 1, order);
+    }
 }
