@@ -17,3 +17,40 @@ The BFV Homomorphic Order Matching Engine addresses these challenges by leveragi
 ## Demo
 Here's a sample output of the BFV Homomorphic Order Matching Engine:
 ![alt text](demo.png)
+
+In this example, the engine successfully matches the buy and sell orders while keeping the order values encrypted during the process. The filled orders are decrypted and displayed at the end, showing which orders were matched and their corresponding values.
+
+## Getting Started
+To run the BFV Homomorphic Order Matching Engine, follow these steps:
+
+1. **Clone the repository**:
+    ```sh
+    git clone https://github.com/Giri-Aayush/bfv-homomorphic-order-matching-engine.git
+    ```
+
+2. **Install Rust and Cargo** (if not already installed):
+    Follow the instructions at [rust-lang.org](https://www.rust-lang.org/).
+
+3. **Navigate to the `caird/operators` directory and buil package**:
+    ```sh
+    cd bfv-homomorphic-order-matching-engine/caird/operators
+    cargo build
+    ```
+4. **Navigate to the `bfv` directory and build package**:
+    ```sh
+    cd bfv-homomorphic-order-matching-engine/bfv
+    cargo build
+    ```
+
+7. **Navigate to the `order-match-engine` directory and build project**:
+    ```sh
+    cd bfv-homomorphic-order-matching-engine/order-match-engine
+    cargo build
+    ```
+
+9. **Run the engine**:
+    ```sh
+    cargo run
+    ```
+
+Make sure to have the necessary dependencies installed and the `order.json` file in the `order-match-engine` directory, containing the buy and sell orders in the specified format. The output of the order matching process will be displayed in the console.
