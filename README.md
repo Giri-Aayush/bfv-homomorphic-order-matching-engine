@@ -4,7 +4,7 @@
 
 Exchanges that see order flow can exploit it: front-running, information leakage from dark pool operators, and MEV extraction all stem from a matching engine that reads orders in the clear. This project explores the alternative, a matching engine written in Rust that performs its arithmetic (order aggregation, running volume, less-than comparisons) on BFV-encrypted order quantities, so the arithmetic of matching never touches a plaintext quantity.
 
-One caveat up front, stated precisely in [What is encrypted and what is revealed](#what-is-encrypted-and-what-is-revealed): this is a single-party demonstration. Comparison results are decrypted at each decision point to drive control flow, so the process is not zero-knowledge end to end. The homomorphic circuits themselves (sums, subtraction, and a degree-65536 comparison polynomial) are real and tested.
+One caveat up front, stated precisely in [What is encrypted and what is revealed](#what-is-encrypted-and-what-is-revealed): comparison results are decrypted at each decision point to drive control flow, so the process is not zero-knowledge end to end. Decryption needs two of three key shares and no process holds a secret key after setup, but the three roles run in one binary with a trusted dealer, not on separate machines. The homomorphic circuits themselves (sums, subtraction, comparison polynomials) are real and tested.
 
 ## Quickstart
 
@@ -53,7 +53,7 @@ The engine refuses a book whose side total reaches t/2 = 32768, since the compar
 (cd order-match-engine && cargo test --release)  # every shipped book, results pinned
 ```
 
-The operators crate has eleven tests and the engine eleven plus one ignored: a random-vector comparison across all 16 slots, a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit, the packed primitives (mask, prefix sum, broadcast total) each checked against plaintext with a final test that runs prefix, broadcast and comparison together and pins that noise too, and the ranged comparison: its tables checked at every interpolation point, both evaluators checked exhaustively on all 576 pairs below 24, agreement with the full circuit on random inputs below 4,096, and the shipped tables loaded and exercised. The engine crate runs every book in both modes and pins five numbers for each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, either matcher, or the decryption accounting shows up as a diff in one of those. The ignored test is the small-lots book at n = 2^15, about 16 s on eleven threads: `cargo test --release -- --ignored`. CI runs all of it on every push, the secure run included.
+The operators crate has fourteen tests and the engine eleven plus one ignored: a random-vector comparison across all 16 slots, a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit, the packed primitives (mask, prefix sum, broadcast total) each checked against plaintext with a final test that runs prefix, broadcast and comparison together and pins that noise too, the ranged comparison: its tables checked at every interpolation point, both evaluators checked exhaustively on all 576 pairs below 24, agreement with the full circuit on random inputs below 4,096, and the shipped tables loaded and exercised. And the roles: public-key ciphertexts decrypt under the secret and cost only a few bits more, a comparison on them fits the budget, all four orderings of party pairs reconstruct a reference decryption, and one party alone does not. The engine crate runs every book in both modes and pins five numbers for each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, either matcher, or the decryption accounting shows up as a diff in one of those. The ignored test is the small-lots book at n = 2^15, about 16 s on eleven threads: `cargo test --release -- --ignored`. CI runs all of it on every push, the secure run included.
 
 ## What the engine does
 
@@ -153,7 +153,7 @@ Every decision the engine makes crosses the boundary out of the encrypted domain
 - Plaintext modulus t = 65537, a Fermat prime, so plaintext slots form Z_65537 and Fermat's little theorem applies with exponent 65536.
 - Ring degree n = 16, so 16 SIMD slots. This is a toy dimension, see Limitations.
 - Ciphertext modulus Q: ten 60-bit primes, about 600 bits total, plus a 180-bit extension modulus P for hybrid key switching.
-- Encryption is symmetric key: the same `SecretKey` encrypts, and later decrypts, in one process. The library has no public-key mode, so a submitter and evaluator split would start there.
+- The library is symmetric-key only. The public key submitters encrypt under, and the 2-of-3 split decryptors hold, are built in `operators::roles` from the ring operations the library exposes. See [Three roles](#three-roles-operatorsroles).
 
 **What runs homomorphically:**
 
@@ -168,7 +168,7 @@ Every decision the engine makes crosses the boundary out of the encrypted domain
 1. One comparison bit per decision: first buy-sum versus sell-sum, then one per order on the larger side. Each is decrypted immediately so plaintext control flow can branch on it.
 2. The quantity of every order that filled, for the report. On the sample book that is seven bits and nine quantities. Neither side total is decrypted as a ciphertext, though the smaller side's total is the sum of its decrypted fills. An unfilled order's quantity is never decrypted.
 
-**Who holds what.** The operators crate takes only the evaluation key. Nothing in `caird/operators` can decrypt. The secret key exists in the engine binary, which is also the party running the match, and in the unit test. That is the single-party caveat above, stated in terms of code.
+**Who holds what.** The comparison and packing operators take only the evaluation key. Nothing in them can decrypt. The engine holds a public key, an evaluation key and three shares, and a secret key exists only inside the dealer function during setup and in the unit tests. Every decryption is a partial from two of the three shares, combined.
 
 ## What is encrypted and what is revealed
 
@@ -182,15 +182,28 @@ An honest scorecard for the "zero plaintext" framing:
 | Running unfilled remainder | Yes, updated by homomorphic subtraction | Only indirectly, through the comparison bits |
 | Which orders filled | n/a (plaintext bookkeeping) | Yes, that is the output |
 
-So the claim that holds is narrower than "zero plaintext": the arithmetic on order quantities is fully homomorphic, but the matching decisions leak one bit per comparison, and the report reveals the quantities that filled. In a deployment this decryption oracle would need to be a threshold-decryption committee or a party structurally separated from order flow. That machinery does not exist in this codebase.
+So the claim that holds is narrower than "zero plaintext": the arithmetic on order quantities is fully homomorphic, but the matching decisions leak one bit per comparison, and the report reveals the quantities that filled. Who learns those is now a 2-of-3 committee rather than the matcher. What is still missing for a deployment is in the next section.
+
+### Three roles (`operators::roles`)
+
+Until this point one process generated the secret, encrypted every order with it, ran the match, and decrypted every result. Now there are three roles, separated by what each key can do.
+
+- **Submitters** encrypt under a public key. The library has no public-key mode, so it is built from the ring operations it exposes: with secret s, a uniform a and a Gaussian e, publish (−(a·s + e), a). Encryption samples a ternary u and two Gaussians and sets (p0·u + e1 + Δm, p1·u + e2). Fresh noise measures 5 bits against the symmetric form's 3.
+- **The matcher** holds the evaluation key and the rotation keys and can decrypt nothing.
+- **Decryptors** hold a replicated 2-of-3 split of the secret: s = s0 + s1 + s2 with two parts uniform, and party i holds parts i and i+1. Any two parties together hold all three, one party holds two. Decryption is linear in s, so each of two parties multiplies c1 by the parts assigned to it, adds 2^520 of uniform smudging noise, and the combiner adds c0 and decodes. Parts go to the lower-numbered holder so the two contributions are disjoint and cover the secret, and the combiner refuses partials that were not computed for each other. The smudging hides the ciphertext's own noise from the combiner, since that noise depends on the computation's inputs, and 520 bits leaves about 50 bits of margin over the noisiest measured ciphertext and about 60 under the rounding threshold.
+
+The secret exists only inside the dealer function, which derives the public and evaluation keys, splits it, and returns without it. The engine rotates through the three pairs so one run exercises all of them, and the report says how many decryptions happened.
+
+What is still one process: the dealer is trusted, since it saw the secret before splitting it, and the three roles are separated by keys rather than machines. Distributed key generation would remove the dealer. Separate machines need ciphertexts on the wire, and the library's `serialize` feature depends on `prost-build`, which needs `protoc` at build time, so that is a build-environment decision before it is a code one.
+
 
 ## Measured performance
 
 Measured on an Apple Silicon Mac (arm64), `--release`, at the toy ring degree n = 16:
 
-- Toy book, walk (7 comparisons, 9 decrypted fills): about 0.15 s wall clock. Packed (3 comparisons): about 0.04 s.
-- `books/eth-usdc.json`, walk (12 comparisons, 18 decrypted fills): about 0.22 s. Packed (5 comparisons on the full circuit, 16 revealed quantities): about 0.10 s. Each full comparison is roughly 16 ms on eleven threads, and the binary prints per-phase timings on every run.
-- `books/small-lots.json`, walk (9 comparisons): about 0.16 s. Packed (4 comparisons on the 4,096 table): about 0.04 s. With `--secure`: about 16 s.
+- Toy book, walk (7 comparisons, 9 decrypted fills): about 0.14 s wall clock. Packed (3 comparisons): about 0.04 s.
+- `books/eth-usdc.json`, walk (12 comparisons, 18 decrypted fills): about 0.23 s. Packed (5 comparisons on the full circuit, 16 revealed quantities): about 0.11 s. Each full comparison is roughly 16 ms on eleven threads, and the binary prints per-phase timings on every run.
+- `books/small-lots.json`, walk (9 comparisons): about 0.17 s. Packed (4 comparisons on the 4,096 table): about 0.04 s. With `--secure`: about 18 s, of which threshold decryption is about 2 s.
 - `less_than_works` test (one comparison on fresh ciphertexts, all 16 slots at once): about 0.11 s including key generation.
 
 These numbers do not transfer to secure parameters. Every polynomial operation scales at least with n log n, and a secure ring degree for a 600-bit modulus is three orders of magnitude larger than 16.
@@ -198,14 +211,14 @@ These numbers do not transfer to secure parameters. Every polynomial operation s
 ## Limitations
 
 - **The default parameters are insecure.** Ring degree 16 with a 600-bit ciphertext modulus offers no meaningful lattice security. The library's own assertion floor is `degree >= 16` and the default runs at that floor. Treat every ciphertext from a default run as toy. `--secure` runs at n = 2^15, with the caveat on the secret's weight above.
-- **Not zero plaintext.** See the scorecard above: comparison bits are decrypted mid-protocol, filled quantities are decrypted for the report, and the secret key lives in the matching process itself.
+- **Not zero plaintext.** See the scorecard above: comparison bits are decrypted mid-protocol and filled quantities are decrypted for the report. The party that learns them is a 2-of-3 committee, but the committee runs inside the same binary.
 - **The walk's fill pattern leaks bounds.** In the sequential walk, the comparison bits together with the decrypted fills give a lower bound on every unfilled quantity. The packed matcher does not have this: past the boundary nothing is computed, so nothing is bounded. Both modes reveal the smaller side's total, since all of its fills are printed.
 - **Quantities only, no prices.** Orders are u64 quantities with an optional id. There is no price, no limit book, and no time priority beyond input order. The `pair` field is only a label.
 - **The walk is greedy, strict, and whole-fill only.** In the sequential walk, orders on the larger side fill first-come against the remaining volume, the strict less-than leaves an order unfilled even when it exactly equals the remainder, and an order can only fill whole. The sample run matches 18 of 21. The packed matcher replaces this with time priority and a partial fill at the boundary, and matches 21 of 21.
 - **Input domain is bounded.** Comparison correctness requires values below t/2, about 32768, and the summed side must also stay below that bound. The engine checks this on load and refuses the book otherwise. The walk uses one slot per ciphertext. The packed matcher uses n/4, half a row, because the library cannot rotate across rows and the other half of the row has to be zero for mask-free prefix sums.
 - **Depth budget is spent on comparison.** One `univariate_less_than` materializes two ladders of 181 powers each, one relinearized ciphertext multiplication per power, with a critical path of about eight squarings per ladder, all against a 10-prime modulus chain with no modulus switching in the call path. Measured: a single comparison leaves about 360 bits of noise in a roughly 600-bit modulus, so a second comparison on its output would not decrypt correctly. That is the concrete reason the walk decrypts a bit between steps rather than chaining. The test `less_than_edges_and_noise_budget` pins the figure. At n = 2^15 the full circuit's noise reaches 583 bits and the result is wrong, which is why `--secure` requires a range-sized circuit.
 - **No benchmarks for the engine.** The `bfv` library ships Criterion benches for its primitives. The matching pipeline prints per-phase wall-clock times but has no benches.
-- **Not production software.** Single binary, secret key generated per run and never persisted, no serialization of ciphertexts (the `serialize` feature of the library is unused by the engine).
+- **Not production software.** Single binary, keys dealt per run by a trusted dealer in-process, no distributed key generation, no serialization of ciphertexts.
 
 ## Repository layout
 
