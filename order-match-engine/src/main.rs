@@ -1,6 +1,7 @@
 mod packed;
 
-use bfv::{BfvParameters, Ciphertext, Encoding, EvaluationKey, Evaluator, SecretKey};
+use bfv::{BfvParameters, Ciphertext, Encoding, EvaluationKey, Evaluator};
+use operators::roles::{combine, PublicKey, Secret, Share};
 use operators::univariate_less_than;
 use rand::rngs::ThreadRng;
 use rand::thread_rng;
@@ -16,6 +17,11 @@ const TOY_DEGREE: usize = 1 << 4;
 /// 2n. With log2(QP) = 780 and a ternary secret of weight n/2 this is roughly 128-bit; see
 /// README for the caveat on the secret's weight.
 const SECURE_DEGREE: usize = 1 << 15;
+/// Uniform noise each decrypting party adds to its partial. It has to dwarf the ciphertext's
+/// own noise, at most about 470 bits after a ranged comparison at n = 2^15, by a statistical
+/// margin, and two of them still have to sit well under Δ/2 ≈ 2^583 for decoding to round
+/// correctly. 520 leaves about 50 bits on each side.
+const SMUDGE_BITS: u64 = 520;
 
 /// An order in the book file: either a bare quantity or `{"id": "...", "qty": N}`.
 /// Ids are not secret and appear in the report. Quantities are the values that get encrypted.
@@ -56,11 +62,14 @@ struct Book {
     range: u64,
 }
 
-/// Everything that can touch a key lives here. The operators crate only ever sees `ek`.
+/// Three roles in one process, kept apart by what each can do. Submitters encrypt with the
+/// public key. The matcher computes with the evaluation key and can decrypt nothing. Each
+/// decryption needs two of the three shares. No secret key exists after setup.
 struct Engine {
     evaluator: Evaluator,
-    sk: SecretKey,
+    pk: PublicKey,
     ek: EvaluationKey,
+    shares: [Share; 3],
     rng: ThreadRng,
     degree: usize,
     comparisons: usize,
@@ -74,12 +83,22 @@ impl Engine {
         let mut rng = thread_rng();
         let mut params = BfvParameters::new(&[60; 10], T, degree);
         params.enable_hybrid_key_switching(&[60; 3]);
-        let sk = SecretKey::random_with_params(&params, &mut rng);
         let evaluator = Evaluator::new(params);
         let rotations = if with_rotations { operators::packed::rotation_indices(&evaluator) } else { vec![] };
+        let (pk, ek, shares) = Self::deal(&evaluator, &rotations, &mut rng);
+        Engine { evaluator, pk, ek, shares, rng, degree, comparisons: 0, decryptions: 0 }
+    }
+
+    /// The dealer. The secret lives only inside this function: it derives the public and
+    /// evaluation keys, splits itself three ways, and is dropped on return.
+    fn deal(evaluator: &Evaluator, rotations: &[isize], rng: &mut ThreadRng) -> (PublicKey, EvaluationKey, [Share; 3]) {
+        let secret = Secret::generate(evaluator.params(), rng);
+        let sk = secret.secret_key();
         let levels = vec![0; rotations.len()];
-        let ek = EvaluationKey::new(evaluator.params(), &sk, &[0], &levels, &rotations, &mut rng);
-        Engine { evaluator, sk, ek, rng, degree, comparisons: 0, decryptions: 0 }
+        let ek = EvaluationKey::new(evaluator.params(), &sk, &[0], &levels, rotations, rng);
+        let pk = secret.public_key(evaluator, rng);
+        let shares = secret.split(evaluator, rng);
+        (pk, ek, shares)
     }
 
     fn params_line(&self) -> String {
@@ -92,12 +111,12 @@ impl Engine {
         self.encrypt_lane(&[quantity])
     }
 
-    /// Encrypt up to a lane of quantities, one per slot from slot 0. Remaining slots are zero.
+    /// Encrypt up to a lane of quantities, one per slot from slot 0, under the public key.
     fn encrypt_lane(&mut self, quantities: &[u64]) -> Ciphertext {
         let mut slots = vec![0u64; self.degree];
         slots[..quantities.len()].copy_from_slice(quantities);
         let pt = self.evaluator.plaintext_encode(&slots, Encoding::default());
-        self.evaluator.encrypt(&self.sk, &pt, &mut self.rng)
+        self.pk.encrypt(&self.evaluator, &pt, &mut self.rng)
     }
 
     /// The only way a value leaves the encrypted domain. Counted so the run can report it.
@@ -105,11 +124,19 @@ impl Engine {
         self.decrypt_slots(ct)[0]
     }
 
-    /// Same boundary crossing, all slots. One decryption however many slots are read.
+    /// Same boundary crossing, all slots: two of the three parties each compute a partial
+    /// and the combiner adds them. Which pair rotates per decryption, so a run exercises all
+    /// three. One decryption however many slots are read.
     fn decrypt_slots(&mut self, ct: &Ciphertext) -> Vec<u64> {
+        let (a, b) = Self::pair(self.decryptions);
         self.decryptions += 1;
-        let pt = self.evaluator.decrypt(&self.sk, ct);
-        self.evaluator.plaintext_decode(&pt, Encoding::default())
+        let pa = self.shares[a].partial_decrypt(&self.evaluator, ct, b, SMUDGE_BITS, &mut self.rng);
+        let pb = self.shares[b].partial_decrypt(&self.evaluator, ct, a, SMUDGE_BITS, &mut self.rng);
+        combine(&self.evaluator, ct, &[pa, pb])
+    }
+
+    fn pair(k: usize) -> (usize, usize) {
+        [(0, 1), (1, 2), (2, 0)][k % 3]
     }
 
     fn sum(&self, cts: &[Ciphertext]) -> Ciphertext {
@@ -218,7 +245,7 @@ fn match_book(path: &str) -> Report {
     println!("bfv order matching   {pair}   {} buys, {} sells   {path}", buy_orders.len(), sell_orders.len());
     println!("{}", engine.params_line());
     println!();
-    phase("keys", "secret key and evaluation key", &mut clock, "");
+    phase("keys", "pk, ek, secret split 2-of-3 and dropped", &mut clock, "");
 
     // Ids stay in the clear. Quantities are encrypted and the plaintext copies dropped, so from
     // here on the only way back to a quantity is a decryption.
@@ -290,6 +317,7 @@ fn match_book(path: &str) -> Report {
     println!();
     println!("  {:<10}{} / {}", "matched", report.matched, report.smaller_total);
     println!("  {:<10}{} comparison bits, {} fill quantities", "revealed", report.comparisons, report.fills_decrypted);
+    println!("  {:<10}{} decryptions, each by two of three parties, no single key held", "decrypted", engine.decryptions);
     println!(
         "  {:<10}{} side total, {} unfilled {}",
         "withheld",

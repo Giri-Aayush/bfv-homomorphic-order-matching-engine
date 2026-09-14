@@ -189,7 +189,7 @@ pub fn match_book(path: &str, degree: usize) -> Report {
     println!("bfv order matching   {pair}   {n_buys} buys, {n_sells} sells   {path}   packed");
     println!("{}", engine.params_line());
     println!();
-    phase("keys", &format!("secret key, evaluation key, {rotations} rotation keys"), &mut clock, "");
+    phase("keys", &format!("pk, ek, {rotations} rotation keys, secret split 2-of-3"), &mut clock, "");
 
     let buy_side = PackedSide::pack(&mut engine, "buy", buys, lane);
     let sell_side = PackedSide::pack(&mut engine, "sell", sells, lane);
@@ -249,6 +249,7 @@ pub fn match_book(path: &str, degree: usize) -> Report {
         "  {:<10}{} bit vectors, {masked_decryptions} masked decryptions, {quantities} quantities",
         "revealed", report.comparisons
     );
+    println!("  {:<10}{} decryptions, each by two of three parties, no single key held", "decrypted", engine.decryptions);
     println!(
         "  {:<10}{larger} side total, {} unfilled {}, and the size of {} boundary order",
         "withheld",
