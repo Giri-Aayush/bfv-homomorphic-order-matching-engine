@@ -12,6 +12,12 @@ pub struct GaloisKey {
 }
 
 impl GaloisKey {
+    /// A Galois key whose switching key was generated elsewhere: c0_j + c1_j·s must equal
+    /// g_j·s(x^exponent) + noise for every digit.
+    pub fn from_ksk(exponent: usize, degree: usize, ksk_key: HybridKeySwitchingKey, level: usize) -> GaloisKey {
+        GaloisKey { substitution: Substitution::new(exponent, degree), ksk_key, level }
+    }
+
     pub fn new<R: CryptoRng + RngCore>(
         exponent: usize,
         params: &BfvParameters,

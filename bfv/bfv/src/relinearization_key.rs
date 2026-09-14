@@ -10,6 +10,12 @@ pub struct RelinearizationKey {
 }
 
 impl RelinearizationKey {
+    /// A relinearization key whose switching key was generated elsewhere: c0_j + c1_j·s must
+    /// equal g_j·s² + noise for every digit.
+    pub fn from_ksk(ksk: HybridKeySwitchingKey, level: usize) -> RelinearizationKey {
+        RelinearizationKey { ksk, level }
+    }
+
     pub fn new<R: CryptoRng + RngCore>(
         params: &BfvParameters,
         sk: &SecretKey,

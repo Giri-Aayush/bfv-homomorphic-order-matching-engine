@@ -732,6 +732,19 @@ pub struct HybridKeySwitchingParameters {
 }
 
 impl HybridKeySwitchingParameters {
+    /// Number of key-switching digits.
+    pub fn dnum(&self) -> usize {
+        self.dnum
+    }
+
+    /// The gadget, one value per digit: g_j = P · Q/Q_j · [(Q/Q_j)^-1]_{Q_j}. Exposed so a
+    /// key-switching key can be generated collectively, outside this crate.
+    pub fn gadget(&self) -> &[BigUint] {
+        &self.g
+    }
+}
+
+impl HybridKeySwitchingParameters {
     pub fn new<T: Ntt>(
         ksk_ctx: &PolyContext<'_, T>,
         specialp_ctx: &PolyContext<'_, T>,

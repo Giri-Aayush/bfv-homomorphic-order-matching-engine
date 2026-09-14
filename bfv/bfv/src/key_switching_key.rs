@@ -149,6 +149,14 @@ pub struct HybridKeySwitchingKey {
 }
 
 impl HybridKeySwitchingKey {
+    /// A key assembled from polynomials produced elsewhere, for collectively generated keys.
+    /// `c0s` and `c1s` are one polynomial per digit in the QP context, evaluation form, with
+    /// c0_j + c1_j·s = g_j·poly + noise. No seed: the c1s are stored, and `switch` reads them.
+    pub fn from_parts(c0s: Vec<Poly>, c1s: Vec<Poly>) -> HybridKeySwitchingKey {
+        assert_eq!(c0s.len(), c1s.len());
+        HybridKeySwitchingKey { seed: None, c0s: c0s.into_boxed_slice(), c1s: c1s.into_boxed_slice() }
+    }
+
     /// Warning: Ciphertext context needs to be as same as KeySwitching Context. This is not
     /// a limitation of hybrid key switching, instead a limitation of the way key switching is
     /// implemented here.
