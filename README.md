@@ -4,7 +4,7 @@
 
 Exchanges that see order flow can exploit it: front-running, information leakage from dark pool operators, and MEV extraction all stem from a matching engine that reads orders in the clear. This project explores the alternative, a matching engine written in Rust that performs its arithmetic (order aggregation, running volume, less-than comparisons) on BFV-encrypted order quantities, so the arithmetic of matching never touches a plaintext quantity.
 
-One caveat up front, stated precisely in [What is encrypted and what is revealed](#what-is-encrypted-and-what-is-revealed): comparison results are decrypted at each decision point to drive control flow, so the process is not zero-knowledge end to end. Decryption needs two of three key shares and no process holds a secret key after setup, but the three roles run in one binary with a trusted dealer, not on separate machines. The homomorphic circuits themselves (sums, subtraction, comparison polynomials) are real and tested.
+One caveat up front, stated precisely in [What is encrypted and what is revealed](#what-is-encrypted-and-what-is-revealed): comparison results are decrypted at each decision point to drive control flow, so the process is not zero-knowledge end to end. Keys are generated collectively by three parties and no secret key exists at any point, decryption needs two of the three, but the three roles run in one binary, not on separate machines. The homomorphic circuits themselves (sums, subtraction, comparison polynomials) are real and tested.
 
 ## Quickstart
 
@@ -53,7 +53,7 @@ The engine refuses a book whose side total reaches t/2 = 32768, since the compar
 (cd order-match-engine && cargo test --release)  # every shipped book, results pinned
 ```
 
-The operators crate has fourteen tests and the engine eleven plus one ignored: a random-vector comparison across all 16 slots, a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit, the packed primitives (mask, prefix sum, broadcast total) each checked against plaintext with a final test that runs prefix, broadcast and comparison together and pins that noise too, the ranged comparison: its tables checked at every interpolation point, both evaluators checked exhaustively on all 576 pairs below 24, agreement with the full circuit on random inputs below 4,096, and the shipped tables loaded and exercised. And the roles: public-key ciphertexts decrypt under the secret and cost only a few bits more, a comparison on them fits the budget, all four orderings of party pairs reconstruct a reference decryption, and one party alone does not. The engine crate runs every book in both modes and pins five numbers for each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, either matcher, or the decryption accounting shows up as a diff in one of those. The ignored test is the small-lots book at n = 2^15, about 16 s on eleven threads: `cargo test --release -- --ignored`. CI runs all of it on every push, the secure run included.
+The operators crate has eighteen tests and the engine eleven plus one ignored: a random-vector comparison across all 16 slots, a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit, the packed primitives (mask, prefix sum, broadcast total) each checked against plaintext with a final test that runs prefix, broadcast and comparison together and pins that noise too, the ranged comparison: its tables checked at every interpolation point, both evaluators checked exhaustively on all 576 pairs below 24, agreement with the full circuit on random inputs below 4,096, and the shipped tables loaded and exercised. The roles: public-key ciphertexts decrypt under the secret and cost only a few bits more, a comparison on them fits the budget, all four orderings of party pairs reconstruct a reference decryption, and one party alone does not. And the collective key generation, as listed in its section. The engine crate runs every book in both modes and pins five numbers for each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, either matcher, or the decryption accounting shows up as a diff in one of those. The ignored test is the small-lots book at n = 2^15, about 16 s on eleven threads: `cargo test --release -- --ignored`. CI runs all of it on every push, the secure run included.
 
 ## What the engine does
 
@@ -111,7 +111,7 @@ Three crates, wired together by path dependencies:
 | --- | --- | --- |
 | `order-match-engine` | `order-match-engine/` | Binary. Loads a book, runs the matching flow above, counts what it decrypts. |
 | `operators` | `caird/operators/` | Homomorphic comparison: `univariate_less_than`, `powers_of_x`, an encrypted `sort`, the coefficient precomputation `compute_lt_coefficients`, and the `packed` module (mask, prefix sum, broadcast total by rotation). |
-| `bfv` | `bfv/bfv/` | The BFV scheme itself: RNS polynomial arithmetic, NTT (via `concrete-ntt`, optional Intel HEXL), encryption, relinearization, hybrid key switching. Vendored from Janmajaya Mall's `bfv` library (MIT license in `bfv/LICENSE`). |
+| `bfv` | `bfv/bfv/` | The BFV scheme itself: RNS polynomial arithmetic, NTT (via `concrete-ntt`, optional Intel HEXL), encryption, relinearization, hybrid key switching. Vendored from Janmajaya Mall's `bfv` library (MIT license in `bfv/LICENSE`), plus 39 added lines: constructors so collectively generated keys can be handed to it. |
 
 ```mermaid
 flowchart TD
@@ -192,9 +192,22 @@ Until this point one process generated the secret, encrypted every order with it
 - **The matcher** holds the evaluation key and the rotation keys and can decrypt nothing.
 - **Decryptors** hold a replicated 2-of-3 split of the secret: s = s0 + s1 + s2 with two parts uniform, and party i holds parts i and i+1. Any two parties together hold all three, one party holds two. Decryption is linear in s, so each of two parties multiplies c1 by the parts assigned to it, adds 2^520 of uniform smudging noise, and the combiner adds c0 and decodes. Parts go to the lower-numbered holder so the two contributions are disjoint and cover the secret, and the combiner refuses partials that were not computed for each other. The smudging hides the ciphertext's own noise from the combiner, since that noise depends on the computation's inputs, and 520 bits leaves about 50 bits of margin over the noisiest measured ciphertext and about 60 under the rounding threshold.
 
-The secret exists only inside the dealer function, which derives the public and evaluation keys, splits it, and returns without it. The engine rotates through the three pairs so one run exercises all of them, and the report says how many decryptions happened.
+The engine rotates through the three pairs so one run exercises all of them, and the report says how many decryptions happened.
 
-What is still one process: the dealer is trusted, since it saw the secret before splitting it, and the three roles are separated by keys rather than machines. Distributed key generation would remove the dealer. Separate machines need ciphertexts on the wire, and the library's `serialize` feature depends on `prost-build`, which needs `protoc` at build time, so that is a build-environment decision before it is a code one.
+### Collective key generation (`operators::dkg`)
+
+There is no dealer. Three parties each sample their own secret, and every key is a sum of published contributions over a common random string derived from one agreed seed, after Mouchet, Troncoso-Pastoriza, Bossuat and Hubaux, "Multiparty Homomorphic Encryption from Ring-Learning-with-Errors", PoPETs 2021.
+
+- Public key, one round: party i publishes −a·s_i + e_i, and the key is (Σ, a).
+- Galois keys, one round each: per digit j, party i publishes g_j·s_i(x^g) + e − a_j·s_i, and the sum is a key for s(x^g) under the joint s.
+- Relinearization key, two rounds: with an ephemeral u_i, party i publishes h0 = −u_i·a_j + g_j·s_i + e and h1 = s_i·a_j + e, then on the sums publishes s_i·h0 + e and (u_i − s_i)·h1 + e. The key is (Σh0' + Σh1', Σh1), and c0 + c1·s = g_j·s² + noise, which is what the library's own generator produces, so the library relinearizes with it unchanged.
+- Decryption shares: each party splits its own secret three ways additively and sends part p to the two holders of part p. A party's share of the joint secret is the sum of what it received, and the 2-of-3 layout above applies as is.
+
+Correctness is tested at every step: the collective public key decrypts under the joint secret and not under any one party's, a collective Galois key rotates, a collective relinearization key relinearizes a product, and a full packed step with collective keys decrypts by threshold to a reference computed through the ring directly. The `--secure` run at n = 2^15 passes with collective keys, so the relinearization key's extra noise fits. Security is the paper's. The implementation follows it and nothing here re-proves it.
+
+The vendored library was edited for this, for the first time: five constructors and two getters so that keys assembled outside the crate can be handed to it. Nothing existing changed.
+
+What is still one process: the three roles are separated by keys rather than machines, and the parties must agree on the seed for the common random string, which in practice comes from a beacon or a hash of commitments. Separate machines need ciphertexts on the wire, and the library's `serialize` feature depends on `prost-build`, which needs `protoc` at build time, so that is a build-environment decision before it is a code one.
 
 
 ## Measured performance
@@ -203,7 +216,7 @@ Measured on an Apple Silicon Mac (arm64), `--release`, at the toy ring degree n 
 
 - Toy book, walk (7 comparisons, 9 decrypted fills): about 0.14 s wall clock. Packed (3 comparisons): about 0.04 s.
 - `books/eth-usdc.json`, walk (12 comparisons, 18 decrypted fills): about 0.23 s. Packed (5 comparisons on the full circuit, 16 revealed quantities): about 0.11 s. Each full comparison is roughly 16 ms on eleven threads, and the binary prints per-phase timings on every run.
-- `books/small-lots.json`, walk (9 comparisons): about 0.17 s. Packed (4 comparisons on the 4,096 table): about 0.04 s. With `--secure`: about 18 s, of which threshold decryption is about 2 s.
+- `books/small-lots.json`, walk (9 comparisons): about 0.17 s. Packed (4 comparisons on the 4,096 table): about 0.04 s. With `--secure`: about 21 s, of which collective key generation is about 4 s and threshold decryption about 2 s.
 - `less_than_works` test (one comparison on fresh ciphertexts, all 16 slots at once): about 0.11 s including key generation.
 
 These numbers do not transfer to secure parameters. Every polynomial operation scales at least with n log n, and a secure ring degree for a 600-bit modulus is three orders of magnitude larger than 16.
@@ -218,7 +231,7 @@ These numbers do not transfer to secure parameters. Every polynomial operation s
 - **Input domain is bounded.** Comparison correctness requires values below t/2, about 32768, and the summed side must also stay below that bound. The engine checks this on load and refuses the book otherwise. The walk uses one slot per ciphertext. The packed matcher uses n/4, half a row, because the library cannot rotate across rows and the other half of the row has to be zero for mask-free prefix sums.
 - **Depth budget is spent on comparison.** One `univariate_less_than` materializes two ladders of 181 powers each, one relinearized ciphertext multiplication per power, with a critical path of about eight squarings per ladder, all against a 10-prime modulus chain with no modulus switching in the call path. Measured: a single comparison leaves about 360 bits of noise in a roughly 600-bit modulus, so a second comparison on its output would not decrypt correctly. That is the concrete reason the walk decrypts a bit between steps rather than chaining. The test `less_than_edges_and_noise_budget` pins the figure. At n = 2^15 the full circuit's noise reaches 583 bits and the result is wrong, which is why `--secure` requires a range-sized circuit.
 - **No benchmarks for the engine.** The `bfv` library ships Criterion benches for its primitives. The matching pipeline prints per-phase wall-clock times but has no benches.
-- **Not production software.** Single binary, keys dealt per run by a trusted dealer in-process, no distributed key generation, no serialization of ciphertexts.
+- **Not production software.** Single binary, three parties simulated in-process, no serialization of ciphertexts, and the CRS seed comes from the process's own randomness rather than a beacon.
 
 ## Repository layout
 

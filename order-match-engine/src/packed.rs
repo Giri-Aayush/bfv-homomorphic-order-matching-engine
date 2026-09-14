@@ -189,7 +189,7 @@ pub fn match_book(path: &str, degree: usize) -> Report {
     println!("bfv order matching   {pair}   {n_buys} buys, {n_sells} sells   {path}   packed");
     println!("{}", engine.params_line());
     println!();
-    phase("keys", &format!("pk, ek, {rotations} rotation keys, secret split 2-of-3"), &mut clock, "");
+    phase("keys", &format!("collective, 3 parties, no dealer, {rotations} rotation keys"), &mut clock, "");
 
     let buy_side = PackedSide::pack(&mut engine, "buy", buys, lane);
     let sell_side = PackedSide::pack(&mut engine, "sell", sells, lane);

@@ -1,10 +1,11 @@
 mod packed;
 
 use bfv::{BfvParameters, Ciphertext, Encoding, EvaluationKey, Evaluator};
-use operators::roles::{combine, PublicKey, Secret, Share};
+use operators::dkg;
+use operators::roles::{combine, PublicKey, Share};
 use operators::univariate_less_than;
 use rand::rngs::ThreadRng;
-use rand::thread_rng;
+use rand::{thread_rng, RngCore};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::time::Instant;
@@ -64,7 +65,8 @@ struct Book {
 
 /// Three roles in one process, kept apart by what each can do. Submitters encrypt with the
 /// public key. The matcher computes with the evaluation key and can decrypt nothing. Each
-/// decryption needs two of the three shares. No secret key exists after setup.
+/// decryption needs two of the three shares. The keys come from three parties running the
+/// collective protocols in `operators::dkg`, so no secret key exists at any point.
 struct Engine {
     evaluator: Evaluator,
     pk: PublicKey,
@@ -85,20 +87,11 @@ impl Engine {
         params.enable_hybrid_key_switching(&[60; 3]);
         let evaluator = Evaluator::new(params);
         let rotations = if with_rotations { operators::packed::rotation_indices(&evaluator) } else { vec![] };
-        let (pk, ek, shares) = Self::deal(&evaluator, &rotations, &mut rng);
+        // The seed of the common random string is the one thing the parties agree on.
+        let mut seed = dkg::Seed::default();
+        rng.fill_bytes(&mut seed);
+        let dkg::Collective { pk, ek, shares } = dkg::setup(&evaluator, &rotations, seed, &mut rng);
         Engine { evaluator, pk, ek, shares, rng, degree, comparisons: 0, decryptions: 0 }
-    }
-
-    /// The dealer. The secret lives only inside this function: it derives the public and
-    /// evaluation keys, splits itself three ways, and is dropped on return.
-    fn deal(evaluator: &Evaluator, rotations: &[isize], rng: &mut ThreadRng) -> (PublicKey, EvaluationKey, [Share; 3]) {
-        let secret = Secret::generate(evaluator.params(), rng);
-        let sk = secret.secret_key();
-        let levels = vec![0; rotations.len()];
-        let ek = EvaluationKey::new(evaluator.params(), &sk, &[0], &levels, rotations, rng);
-        let pk = secret.public_key(evaluator, rng);
-        let shares = secret.split(evaluator, rng);
-        (pk, ek, shares)
     }
 
     fn params_line(&self) -> String {
@@ -245,7 +238,7 @@ fn match_book(path: &str) -> Report {
     println!("bfv order matching   {pair}   {} buys, {} sells   {path}", buy_orders.len(), sell_orders.len());
     println!("{}", engine.params_line());
     println!();
-    phase("keys", "pk, ek, secret split 2-of-3 and dropped", &mut clock, "");
+    phase("keys", "collective, 3 parties, no dealer, 2-of-3 shares", &mut clock, "");
 
     // Ids stay in the clear. Quantities are encrypted and the plaintext copies dropped, so from
     // here on the only way back to a quantity is a decryption.
