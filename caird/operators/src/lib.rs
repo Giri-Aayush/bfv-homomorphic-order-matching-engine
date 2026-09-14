@@ -7,6 +7,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use utils::store_values;
 
 pub mod packed;
+pub mod ranged;
 pub mod utils;
 
 /// Coefficients of g for t = 65537, produced once by `compute_lt_coefficients` and embedded
