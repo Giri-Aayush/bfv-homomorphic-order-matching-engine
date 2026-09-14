@@ -1,0 +1,5 @@
+{
+  "pair": "EDGE/CASE",
+  "buy_orders": [500, 300, 200],
+  "sell_orders": [400, 100]
+}
