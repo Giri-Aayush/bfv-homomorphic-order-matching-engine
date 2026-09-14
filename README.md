@@ -41,6 +41,7 @@ The two modes are described below and print the same shape of report, so a book 
 | `books/eth-usdc.json` | Eleven buys with ids against ten sells, two lanes per side. | 12 comparisons, 13,715 of 13,730 | 3 comparisons, 13,730 of 13,730 |
 | `books/btc-usdt.json` | The sell side is larger. | 6 comparisons, 2,540 of 2,875 | 2 comparisons, 2,875 of 2,875 |
 | `books/equal-remainder.json` | An order exactly equals what is left at its turn. | The walk's strict less-than leaves it unfilled | Fills exactly, then a partial of zero |
+| `books/small-lots.json` | Eight buys against six sells with both totals below 4,096, so the packed matcher uses the shipped 4,096 comparison table. | 9 comparisons, 2,645 of 2,780, 0.55 s | 2 comparisons, 2,780 of 2,780, 0.04 s |
 
 The engine refuses a book whose side total reaches t/2 = 32768, since the comparison circuit is only correct below that bound. It also refuses an empty side, a zero quantity, and a duplicate id. All of these are the submitter's checks, done on plaintext the submitter already holds, before anything is encrypted.
 
@@ -51,7 +52,7 @@ The engine refuses a book whose side total reaches t/2 = 32768, since the compar
 (cd order-match-engine && cargo test --release)  # every shipped book, results pinned
 ```
 
-The operators crate has seven tests: a random-vector comparison across all 16 slots, a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit, and the packed primitives (mask, prefix sum, broadcast total) each checked against plaintext, with a final test that runs prefix, broadcast and comparison together and pins that noise too. The engine crate runs every book in both modes and pins five numbers for each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, either matcher, or the decryption accounting shows up as a diff in one of those. CI runs all of it on every push.
+The operators crate has eleven tests: a random-vector comparison across all 16 slots, a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit, the packed primitives (mask, prefix sum, broadcast total) each checked against plaintext with a final test that runs prefix, broadcast and comparison together and pins that noise too, and the ranged comparison: its tables checked at every interpolation point, both evaluators checked exhaustively on all 576 pairs below 24, agreement with the full circuit on random inputs below 4,096, and the shipped tables loaded and exercised. The engine crate runs every book in both modes and pins five numbers for each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, either matcher, or the decryption accounting shows up as a diff in one of those. CI runs all of it on every push.
 
 ## What the engine does
 
@@ -76,6 +77,18 @@ The walk spends one comparison and one decrypted bit per order. The packed match
 5. The other side is processed the same way. If it is the smaller side, no bit is ever set and it fills whole.
 
 That is time priority with partial fills. The smaller side is filled to the unit on every book, and the equal-remainder case that the walk leaves unfilled fills exactly. It also leaks less than the walk: the bit vector says where the boundary is and nothing more, the boundary order's size stays encrypted, and nothing about orders behind it is learned, not even a lower bound. On `books/eth-usdc.json` that is 3 comparisons and 16 revealed quantities against the walk's 12 and 18.
+
+### A comparison sized to the book (`compare_ranged`)
+
+The full circuit's polynomial has degree t − 1 because it extracts sign over all of Z_t. But the engine knows, on the submitter's side and before anything is encrypted, that every comparison operand is below R = 1 + the larger side total. The sign function then only has to be right on 2R − 1 points, so the same odd/even split works with two polynomials in z² of degree about R, interpolated once per R:
+
+    LT(x, y) = (1 − e(z²) − z·h(z²)) / 2,   e(0) = 1, e(k²) = 0, h(k²) = 1/k for 0 < k < R
+
+`less_than_ranged` evaluates both and returns a bit. That costs 2R plaintext multiplies against the full circuit's 32,768, so it only wins below R ≈ t/4. `compare_ranged` evaluates only h and returns 1, 0, or t/2 + 1 for less, greater, or equal. The engine decrypts every comparison anyway, so that is all it needs, at R plaintext multiplies, and it never loses. Measured at n = 16 against the full circuit's 0.061 s: the bit form takes 0.006 s at R = 1,024, 0.017 s at 4,096 and 0.032 s at 8,192, and the three-valued form takes 0.010 s at 4,096. Noise is lower too, 290 bits against 370 at R = 4,096, because the ladders are shorter.
+
+Tables for R = 4,096 and 16,384 ship in `order-match-engine/data/`, built once by `operators ranged <R>` (O(R²), seconds). The packed matcher picks the smallest shipped table that covers the book and falls back to the full circuit otherwise. `books/eth-usdc.json` has a buy side of 19,715 and stays on the full circuit; `books/small-lots.json` fits the 4,096 table and its whole packed run takes 0.04 s.
+
+This corrects an earlier plan. The digit-decomposition trick in Iliashenko and Zucca compares numbers encrypted as digits. Our operands are prefix sums, which are Z_t elements produced homomorphically, and extracting digits from one of those is itself a degree-t problem. Sizing the circuit to the range is what actually composes with homomorphic summation. The trade a venue can make is coarser lots for cheaper comparisons.
 
 ## Architecture
 
@@ -163,7 +176,8 @@ So the claim that holds is narrower than "zero plaintext": the arithmetic on ord
 Measured on an Apple Silicon Mac (arm64), `--release`, at the toy ring degree n = 16:
 
 - Toy book, walk (7 comparisons, 9 decrypted fills): about 0.46 s wall clock. Packed (2 comparisons): about 0.14 s.
-- `books/eth-usdc.json`, walk (12 comparisons, 18 decrypted fills): about 0.75 s. Packed (3 comparisons, 16 revealed quantities): about 0.20 s. Each comparison is roughly 55 ms, and the binary prints per-phase timings on every run.
+- `books/eth-usdc.json`, walk (12 comparisons, 18 decrypted fills): about 0.75 s. Packed (3 comparisons on the full circuit, 16 revealed quantities): about 0.20 s. Each full comparison is roughly 55 ms, and the binary prints per-phase timings on every run.
+- `books/small-lots.json`, walk (9 comparisons): about 0.55 s. Packed (2 comparisons on the 4,096 table): about 0.04 s.
 - `less_than_works` test (one comparison on fresh ciphertexts, all 16 slots at once): about 0.11 s including key generation.
 
 These numbers do not transfer to secure parameters. Every polynomial operation scales at least with n log n, and a secure ring degree for a 600-bit modulus is three orders of magnitude larger than 16.
@@ -183,7 +197,7 @@ These numbers do not transfer to secure parameters. Every polynomial operation s
 ## Repository layout
 
 ```
-order-match-engine/   binary crate: the matching flow, order.json, books/, data/less_than.bin
+order-match-engine/   binary crate: both matchers, order.json, books/, data/ (full and ranged comparison tables)
 caird/operators/      comparison and sorting circuits over BFV ciphertexts
 bfv/                  vendored BFV library (workspace: bfv, traits), MIT licensed
 ```

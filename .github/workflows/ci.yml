@@ -26,3 +26,4 @@ jobs:
         run: |
           cargo run --release -- books/eth-usdc.json
           cargo run --release -- --packed books/eth-usdc.json
+          cargo run --release -- --packed books/small-lots.json
