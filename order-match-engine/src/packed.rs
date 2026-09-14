@@ -16,6 +16,7 @@
 use crate::{phase, read_book, Book, Engine, Order, Report, SLOTS, T};
 use bfv::Ciphertext;
 use operators::packed::{broadcast_sum, lane_len, mask, prefix_sum};
+use operators::ranged::{compare_ranged, LtTable};
 use operators::univariate_less_than;
 use std::time::Instant;
 
@@ -61,8 +62,39 @@ enum Fill {
     None,
 }
 
+/// Which comparison circuit a run uses: one sized to the book's range when a shipped table
+/// covers it, else the full-domain circuit.
+enum Circuit {
+    Ranged(&'static LtTable),
+    Full,
+}
+
+impl Circuit {
+    fn for_range(range: u64) -> Self {
+        LtTable::shipped(range).map_or(Circuit::Full, Circuit::Ranged)
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Circuit::Ranged(t) => format!("ranged LT R={}", t.range),
+            Circuit::Full => "full LT R=32768".to_string(),
+        }
+    }
+
+    /// One slot per order: 1 where x < y. The ranged circuit also has an equal marker, and
+    /// equal is not less, so both decode the same way.
+    fn less_than(&self, engine: &mut Engine, x: &Ciphertext, y: &Ciphertext) -> Vec<bool> {
+        let ct = match self {
+            Circuit::Ranged(t) => compare_ranged(&engine.evaluator, x, y, &engine.ek, t),
+            Circuit::Full => univariate_less_than(&engine.evaluator, x, y, &engine.ek),
+        };
+        engine.comparisons += 1;
+        engine.decrypt_slots(&ct).into_iter().map(|v| v == 1).collect()
+    }
+}
+
 /// Match one side against the other side's encrypted total, one comparison per lane.
-fn fill_side(engine: &mut Engine, side: &PackedSide, other_total: &Ciphertext) -> Vec<Fill> {
+fn fill_side(engine: &mut Engine, side: &PackedSide, other_total: &Ciphertext, circuit: &Circuit) -> Vec<Fill> {
     let mut fills = Vec::with_capacity(side.len());
     let mut boundary_seen = false;
     // Cumulative volume of the lanes before this one, broadcast, so lane k's prefixes are
@@ -83,12 +115,10 @@ fn fill_side(engine: &mut Engine, side: &PackedSide, other_total: &Ciphertext) -
             prefix = engine.evaluator.add(&prefix, c);
         }
 
-        // over[i] = 1 where cumulative volume through order i exceeds the other side's total.
-        let over_ct = univariate_less_than(&engine.evaluator, other_total, &prefix, &engine.ek);
-        engine.comparisons += 1;
-        let over = engine.decrypt_slots(&over_ct);
-        let whole: Vec<bool> = (0..n).map(|i| over[i] == 0).collect();
-        let boundary = (0..n).find(|&i| over[i] == 1);
+        // over[i] where cumulative volume through order i exceeds the other side's total.
+        let over = circuit.less_than(engine, other_total, &prefix);
+        let whole: Vec<bool> = (0..n).map(|i| !over[i]).collect();
+        let boundary = (0..n).find(|&i| over[i]);
 
         // Reveal only the whole fills: mask everything else to zero before decrypting.
         let revealed = engine.decrypt_slots(&mask(&engine.evaluator, lane_ct, &whole));
@@ -137,9 +167,10 @@ fn print_side(side: &PackedSide, fills: &[Fill], against: &str) {
 pub fn match_book(path: &str) -> Report {
     let started = Instant::now();
     let mut clock = Instant::now();
-    let Book { pair, buys, sells } = read_book(path);
+    let Book { pair, buys, sells, range } = read_book(path);
     let n_buys = buys.len();
     let n_sells = sells.len();
+    let circuit = Circuit::for_range(range);
 
     println!();
     println!("bfv order matching   {pair}   {n_buys} buys, {n_sells} sells   {path}   packed");
@@ -164,8 +195,8 @@ pub fn match_book(path: &str) -> Report {
     let sell_total = sell_side.total(&engine);
     phase("totals", "Σbuys and Σsells by rotation, never decrypted", &mut clock, "");
 
-    let buy_fills = fill_side(&mut engine, &buy_side, &sell_total);
-    let sell_fills = fill_side(&mut engine, &sell_side, &buy_total);
+    let buy_fills = fill_side(&mut engine, &buy_side, &sell_total, &circuit);
+    let sell_fills = fill_side(&mut engine, &sell_side, &buy_total, &circuit);
     let not_whole = |fills: &[Fill]| fills.iter().any(|f| !matches!(f, Fill::Whole(_)));
     let (larger, note) = match (not_whole(&buy_fills), not_whole(&sell_fills)) {
         (true, _) => ("buy", "buy side is larger"),
@@ -174,7 +205,7 @@ pub fn match_book(path: &str) -> Report {
     };
     phase(
         "match",
-        &format!("prefix sums, one LT per lane, {} comparisons", engine.comparisons),
+        &format!("prefix + {} per lane, {} comparisons", circuit.describe(), engine.comparisons),
         &mut clock,
         note,
     );
@@ -248,6 +279,22 @@ mod tests {
         assert_eq!(
             match_book("books/btc-usdt.json"),
             Report { matched: 2875, smaller_total: 2875, comparisons: 2, fills_decrypted: 7, unfilled: 2 }
+        );
+    }
+
+    #[test]
+    fn circuit_choice_follows_the_book_range() {
+        assert!(matches!(Circuit::for_range(2781), Circuit::Ranged(t) if t.range == 4096));
+        assert!(matches!(Circuit::for_range(4097), Circuit::Ranged(t) if t.range == 16384));
+        assert!(matches!(Circuit::for_range(19716), Circuit::Full));
+    }
+
+    /// Totals below 4096, so the shipped 4096 table is used.
+    #[test]
+    fn small_lots_use_the_ranged_circuit() {
+        assert_eq!(
+            match_book("books/small-lots.json"),
+            Report { matched: 2780, smaller_total: 2780, comparisons: 2, fills_decrypted: 14, unfilled: 0 }
         );
     }
 

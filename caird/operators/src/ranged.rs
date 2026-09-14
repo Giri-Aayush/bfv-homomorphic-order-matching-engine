@@ -18,11 +18,22 @@
 //! multiplies, and it never loses. This is the trade a venue can actually make: coarser
 //! lots, cheaper comparisons.
 
+use std::sync::OnceLock;
+
 use bfv::{
     Ciphertext, Encoding, EvaluationKey, Evaluator, Modulus, PolyCache, PolyType, Representation,
 };
+use byteorder::{ByteOrder, LittleEndian};
 
 use crate::powers_of_x;
+
+/// h tables shipped for the ranges a book is likely to need, built once by the operators
+/// binary (`operators ranged <R>`). Only h: these back `compare_ranged`, and the full-circuit
+/// table already covers callers that need a bit inside the encrypted domain.
+const SHIPPED: &[(u64, &[u8])] = &[
+    (4096, include_bytes!("../../../order-match-engine/data/lt-h-4096.bin")),
+    (16384, include_bytes!("../../../order-match-engine/data/lt-h-16384.bin")),
+];
 
 /// Interpolated tables for one bound. Both are already halved, so the evaluators compute
 /// inv2 − e'(w) − z·h'(w) or inv2 − z·h'(w) with no scalar multiply at the end. Coefficients
@@ -83,10 +94,39 @@ impl LtTable {
             }
         }
 
-        let baby = ((e.len() as f64).sqrt().ceil() as usize).max(2);
-        let mut table = LtTable { range, baby, e, h, inv2 };
+        let mut table = LtTable { range, baby: Self::baby_for(range), e, h, inv2 };
         table.pad();
         table
+    }
+
+    /// The smallest shipped table whose range covers `range`, if any. Loaded once.
+    pub fn shipped(range: u64) -> Option<&'static LtTable> {
+        static TABLES: OnceLock<Vec<LtTable>> = OnceLock::new();
+        let tables = TABLES.get_or_init(|| {
+            SHIPPED.iter().map(|&(r, bytes)| Self::from_h_bytes(65537, r, bytes)).collect()
+        });
+        tables.iter().find(|t| t.range >= range)
+    }
+
+    /// Raw h coefficients as written by `store_h`. Such a table has no equality polynomial,
+    /// so it serves `compare_ranged` only.
+    fn from_h_bytes(t: u64, range: u64, bytes: &[u8]) -> Self {
+        let mut h = vec![0u64; bytes.len() / 8];
+        LittleEndian::read_u64_into(bytes, &mut h);
+        assert_eq!(h.len() as u64, range - 1, "h table for range {range} has the wrong length");
+        let mut table = LtTable { range, baby: Self::baby_for(range), e: vec![], h, inv2: Modulus::new(t).inv(2) };
+        table.pad();
+        table
+    }
+
+    /// Write the unpadded h coefficients to `data/lt-h-<range>.bin` for shipping.
+    pub fn store_h(&self) {
+        let m = self.range as usize - 1;
+        crate::utils::store_values(&self.h[..m], &format!("lt-h-{}.bin", self.range));
+    }
+
+    fn baby_for(range: u64) -> usize {
+        ((range as f64).sqrt().ceil() as usize).max(2)
     }
 
     /// Pad both tables to a whole number of baby blocks so every block has a w^1 term.
@@ -103,7 +143,7 @@ impl LtTable {
     }
 
     fn giant_steps(&self) -> usize {
-        self.e.len() / self.baby - 1
+        self.e.len().max(self.h.len()) / self.baby - 1
     }
 
     /// Value `compare_ranged` returns in a slot where the operands are equal.
@@ -215,6 +255,7 @@ pub fn less_than_ranged(
     table: &LtTable,
 ) -> Ciphertext {
     let (baby, giant, zh) = ladders_and_zh(evaluator, x, y, ek, table);
+    assert!(!table.e.is_empty(), "this table was loaded from shipped h coefficients and has no equality polynomial; build one with LtTable::for_range");
     let e = eval_bsgs(evaluator, &baby, &giant, &table.e, ek);
     half_minus(evaluator, table, evaluator.add(&e, &zh))
 }
@@ -316,6 +357,27 @@ mod tests {
                 .collect();
             assert_eq!(three, want, "compare x={x:?} y={y:?}");
         }
+    }
+
+    #[test]
+    fn shipped_tables_cover_their_ranges_and_compare_correctly() {
+        let mut f = Fixture::new();
+        assert!(LtTable::shipped(20_000).is_none());
+        let small = LtTable::shipped(3000).unwrap();
+        let big = LtTable::shipped(13731).unwrap();
+        assert_eq!((small.range, big.range), (4096, 16384));
+
+        let x = vec![13730, 0, 4095, 1, 9999, 16383, 7, 7, 0, 0, 0, 0, 0, 0, 0, 0];
+        let y = vec![13731, 0, 4094, 0, 9999, 0, 8, 6, 0, 0, 0, 0, 0, 0, 0, 0];
+        let cx = f.enc(&x);
+        let cy = f.enc(&y);
+        let got = f.dec(&compare_ranged(&f.evaluator, &cx, &cy, &f.ek, big));
+        let want: Vec<u64> = x
+            .iter()
+            .zip(&y)
+            .map(|(a, b)| if a < b { 1 } else if a > b { 0 } else { big.equal_marker() })
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[test]

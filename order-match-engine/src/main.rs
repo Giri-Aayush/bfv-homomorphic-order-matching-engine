@@ -47,6 +47,9 @@ struct Book {
     pair: String,
     buys: Vec<Order>,
     sells: Vec<Order>,
+    /// One more than the largest side total. Every comparison operand is below it, which
+    /// lets the packed matcher pick a comparison circuit sized to the book.
+    range: u64,
 }
 
 /// Everything that can touch a key lives here. The operators crate only ever sees `ek`.
@@ -133,10 +136,11 @@ fn read_book(path: &str) -> Book {
     let to_orders = |side: &str, specs: Vec<OrderSpec>| -> Vec<Order> {
         specs.into_iter().enumerate().map(|(i, o)| o.into_order(side, i)).collect()
     };
-    let book = Book {
+    let mut book = Book {
         pair: file.pair,
         buys: to_orders("B", file.buy_orders),
         sells: to_orders("S", file.sell_orders),
+        range: 0,
     };
 
     let bound = T / 2;
@@ -161,6 +165,7 @@ fn read_book(path: &str) -> Book {
                 "{path}: {side} side totals {total}, but the comparison circuit is only correct below t/2 = {bound}"
             ));
         }
+        book.range = book.range.max(total + 1);
     }
     book
 }
@@ -196,7 +201,7 @@ struct Report {
 fn match_book(path: &str) -> Report {
     let started = Instant::now();
     let mut clock = Instant::now();
-    let Book { pair, buys: buy_orders, sells: sell_orders } = read_book(path);
+    let Book { pair, buys: buy_orders, sells: sell_orders, .. } = read_book(path);
 
     println!();
     println!("bfv order matching   {pair}   {} buys, {} sells   {path}", buy_orders.len(), sell_orders.len());
@@ -337,6 +342,14 @@ mod tests {
         assert_eq!(
             match_book("books/btc-usdt.json"),
             Report { matched: 2540, smaller_total: 2875, comparisons: 6, fills_decrypted: 8, unfilled: 1 }
+        );
+    }
+
+    #[test]
+    fn small_lots_book() {
+        assert_eq!(
+            match_book("books/small-lots.json"),
+            Report { matched: 2645, smaller_total: 2780, comparisons: 9, fills_decrypted: 13, unfilled: 1 }
         );
     }
 
