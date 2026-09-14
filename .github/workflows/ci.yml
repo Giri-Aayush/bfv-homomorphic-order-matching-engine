@@ -27,3 +27,6 @@ jobs:
           cargo run --release -- books/eth-usdc.json
           cargo run --release -- --packed books/eth-usdc.json
           cargo run --release -- --packed books/small-lots.json
+      - name: engine, secure degree
+        working-directory: order-match-engine
+        run: cargo test --release -- --ignored
