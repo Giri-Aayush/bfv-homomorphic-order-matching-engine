@@ -17,10 +17,14 @@
 //!   p to the two parties that hold part p. A party's share of the joint secret is the sum of
 //!   what it received, so the replicated 2-of-3 layout in `roles` applies unchanged.
 //!
-//! What this does not remove: the parties must agree on the seed for the common random
-//! string, which in practice comes from a beacon or a hash of commitments. Correctness is
-//! tested here. Security is the paper's, and the implementation follows it, but nothing here
-//! re-proves it.
+//! The relinearization protocol is the paper's Protocol 2 line for line. The paper's model
+//! is passive (semi-honest): a party that publishes a wrong contribution breaks the key,
+//! and nothing here detects that. Its smudging is Gaussian with variance 2^λ·σ_ct², tracked
+//! per ciphertext; `roles` uses a fixed uniform 2^520 sized to the noisiest measured
+//! ciphertext instead. The parties must agree on the seed for the common random string,
+//! which the paper says any keyed PRF can provide in the passive model and which in
+//! practice comes from a beacon or a hash of commitments. Correctness is tested here.
+//! Security is the paper's, and nothing here re-proves it.
 
 use bfv::{
     rot_to_galois_element, EvaluationKey, Evaluator, GaloisKey, HybridKeySwitchingKey, Poly, PolyType,
