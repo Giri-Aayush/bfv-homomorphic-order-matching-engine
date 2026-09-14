@@ -1,12 +1,13 @@
 //! Several values per ciphertext, one per SIMD slot, and the row-wise primitives a packed
 //! matcher needs: prefix sums, row totals broadcast to every slot, and 0/1 masks.
 //!
-//! BFV batching lays the n slots out as two rows of n/2. This library's Galois keys rotate
-//! within a row and it has no row swap, so a lane lives in one row. It uses only the first
-//! half of that row, `lane_len` = n/4 slots, so that a right rotation by less than a lane
-//! wraps zeros in from the empty half. That is what lets `prefix_sum` run without a mask:
-//! rotations add a little additive noise, a step mask multiplies noise by about t·√n, and
-//! at n = 2^15 fourteen of those ate the whole budget. The second row is carried unused.
+//! BFV batching lays the n slots out as two rows of n/2. Rotations act within a row, and
+//! the row swap is a separate key (rotation index 2n − 1), which this module does not use.
+//! A lane lives in one row and uses only its first half, `lane_len` = n/4 slots, so that a
+//! right rotation by less than a lane wraps zeros in from the empty half. That is what lets
+//! `prefix_sum` run without a mask: rotations add a little additive noise, a step mask
+//! multiplies noise by about t·√n, and at n = 2^15 fourteen of those ate the whole budget.
+//! The second row is carried unused. With the row swap it could carry a second lane.
 
 use bfv::{Ciphertext, Encoding, EvaluationKey, Evaluator, PolyCache, PolyType, Representation};
 
@@ -175,3 +176,4 @@ mod tests {
         assert!(noise < 540, "only {} bits of budget left", 600 - noise as i64);
     }
 }
+
