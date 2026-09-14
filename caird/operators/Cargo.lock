@@ -238,6 +238,7 @@ version = "0.1.0"
 dependencies = [
  "bfv",
  "byteorder",
+ "num-bigint",
  "rand",
  "rayon",
 ]

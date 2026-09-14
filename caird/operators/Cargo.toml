@@ -10,3 +10,4 @@ bfv = {path = "./../../bfv/bfv"}
 byteorder = "1.4.3"
 rand = "0.8.5"
 rayon = "1"
+num-bigint = { version = "0.4.3", features = ["rand"] }
