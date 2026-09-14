@@ -1,3 +1,5 @@
+mod packed;
+
 use bfv::{BfvParameters, Ciphertext, Encoding, EvaluationKey, Evaluator, SecretKey};
 use operators::univariate_less_than;
 use rand::rngs::ThreadRng;
@@ -58,30 +60,43 @@ struct Engine {
 }
 
 impl Engine {
-    fn new() -> Self {
+    /// The sequential walk needs relinearization at level 0 and nothing else. The packed
+    /// matcher also needs the rotation keys behind prefix sums and broadcast totals.
+    fn new(with_rotations: bool) -> Self {
         let mut rng = thread_rng();
         let mut params = BfvParameters::new(&[60; 10], T, SLOTS);
         params.enable_hybrid_key_switching(&[60; 3]);
         let sk = SecretKey::random_with_params(&params, &mut rng);
         let evaluator = Evaluator::new(params);
-        // Relinearization at level 0 is all the comparison circuit needs. No rotation keys.
-        let ek = EvaluationKey::new(evaluator.params(), &sk, &[0], &[], &[], &mut rng);
+        let rotations = if with_rotations { operators::packed::rotation_indices(&evaluator) } else { vec![] };
+        let levels = vec![0; rotations.len()];
+        let ek = EvaluationKey::new(evaluator.params(), &sk, &[0], &levels, &rotations, &mut rng);
         Engine { evaluator, sk, ek, rng, comparisons: 0, decryptions: 0 }
     }
 
     /// Encrypt one quantity into slot 0.
     fn encrypt(&mut self, quantity: u64) -> Ciphertext {
+        self.encrypt_lane(&[quantity])
+    }
+
+    /// Encrypt up to a lane of quantities, one per slot from slot 0. Remaining slots are zero.
+    fn encrypt_lane(&mut self, quantities: &[u64]) -> Ciphertext {
         let mut slots = vec![0u64; SLOTS];
-        slots[0] = quantity;
+        slots[..quantities.len()].copy_from_slice(quantities);
         let pt = self.evaluator.plaintext_encode(&slots, Encoding::default());
         self.evaluator.encrypt(&self.sk, &pt, &mut self.rng)
     }
 
     /// The only way a value leaves the encrypted domain. Counted so the run can report it.
     fn decrypt(&mut self, ct: &Ciphertext) -> u64 {
+        self.decrypt_slots(ct)[0]
+    }
+
+    /// Same boundary crossing, all slots. One decryption however many slots are read.
+    fn decrypt_slots(&mut self, ct: &Ciphertext) -> Vec<u64> {
         self.decryptions += 1;
         let pt = self.evaluator.decrypt(&self.sk, ct);
-        self.evaluator.plaintext_decode(&pt, Encoding::default())[0]
+        self.evaluator.plaintext_decode(&pt, Encoding::default())
     }
 
     fn sum(&self, cts: &[Ciphertext]) -> Ciphertext {
@@ -188,7 +203,7 @@ fn match_book(path: &str) -> Report {
     println!("params               n={SLOTS}  t={T}  Q=10x60-bit  P=3x60-bit   (toy degree, see README)");
     println!();
 
-    let mut engine = Engine::new();
+    let mut engine = Engine::new(false);
     phase("keys", "secret key and evaluation key", &mut clock, "");
 
     // Ids stay in the clear. Quantities are encrypted and the plaintext copies dropped, so from
@@ -275,8 +290,23 @@ fn match_book(path: &str) -> Report {
 }
 
 fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "order.json".to_string());
-    match_book(&path);
+    let mut packed = false;
+    let mut path = "order.json".to_string();
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--packed" => packed = true,
+            "--help" | "-h" => {
+                eprintln!("usage: order-match-engine [--packed] [book.json]");
+                std::process::exit(0)
+            }
+            other => path = other.to_string(),
+        }
+    }
+    if packed {
+        packed::match_book(&path);
+    } else {
+        match_book(&path);
+    }
 }
 
 #[cfg(test)]
