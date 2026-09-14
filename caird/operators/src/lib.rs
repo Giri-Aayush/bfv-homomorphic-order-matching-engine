@@ -1,19 +1,30 @@
-use std::sync::Arc;
+use std::sync::OnceLock;
 
 use bfv::{
-    Ciphertext, Encoding, EvaluationKey, Evaluator, Modulus, Plaintext, PolyCache, PolyType,
-    Representation, SecretKey,
+    Ciphertext, Encoding, EvaluationKey, Evaluator, Modulus, PolyCache, PolyType, Representation,
 };
-use rand::thread_rng;
-use utils::{decrypt_and_print, read_values, store_values};
+use byteorder::{ByteOrder, LittleEndian};
+use utils::store_values;
 
 pub mod utils;
+
+/// Coefficients of g for t = 65537, produced once by `compute_lt_coefficients` and embedded
+/// at build time so the binary and the tests need no data directory at run time.
+const LT_COEFFICIENTS_LE: &[u8] = include_bytes!("../../../order-match-engine/data/less_than.bin");
+
+fn lt_coefficients() -> &'static [u64] {
+    static DECODED: OnceLock<Vec<u64>> = OnceLock::new();
+    DECODED.get_or_init(|| {
+        let mut out = vec![0u64; LT_COEFFICIENTS_LE.len() / 8];
+        LittleEndian::read_u64_into(LT_COEFFICIENTS_LE, &mut out);
+        out
+    })
+}
 
 pub fn powers_of_x(
     evaluator: &Evaluator,
     x: &Ciphertext,
     max: usize,
-    sk: &SecretKey,
     ek: &EvaluationKey,
 ) -> Vec<Ciphertext> {
     let dummy = Ciphertext::new(vec![], PolyType::Q, 0);
@@ -21,7 +32,6 @@ pub fn powers_of_x(
     let mut calculated = vec![0u64; max];
     values[0] = x.clone();
     calculated[0] = 1;
-    // let mut mul_count = 0;
 
     for i in (2..(max + 1)).rev() {
         let mut exp = i;
@@ -35,9 +45,7 @@ pub fn powers_of_x(
                 if res_deg != base_deg && calculated[res_deg - 1] == 0 {
                     let tmp = evaluator.mul(&values[p_res_deg - 1], &values[base_deg - 1]);
                     values[res_deg - 1] = evaluator.relinearize(&tmp, ek);
-                    // println!("Res deg time: {:?}", now.elapsed());
                     calculated[res_deg - 1] = 1;
-                    // mul_count += 1;
                 }
             }
             exp >>= 1;
@@ -49,13 +57,10 @@ pub fn powers_of_x(
                     values[base_deg - 1] = evaluator.relinearize(&tmp, ek);
 
                     calculated[base_deg - 1] = 1;
-
-                    // mul_count += 1;
                 }
             }
         }
     }
-    // dbg!(mul_count);
 
     values
 }
@@ -64,7 +69,6 @@ pub fn sort(
     evaluator: &Evaluator,
     values: &[Ciphertext],
     ek: &EvaluationKey,
-    sk: &SecretKey,
 ) -> Vec<Ciphertext> {
     let mut ht = vec![Ciphertext::placeholder(); values.len()];
 
@@ -78,7 +82,7 @@ pub fn sort(
     for i in 0..values.len() {
         for j in 0..values.len() {
             if i < j {
-                let lt = univariate_less_than(evaluator, &values[i], &values[j], ek, sk);
+                let lt = univariate_less_than(evaluator, &values[i], &values[j], ek);
 
                 let mut one_minus_lt = evaluator.negate(&lt);
                 evaluator.add_assign_plaintext(&mut one_minus_lt, &one);
@@ -106,7 +110,7 @@ pub fn sort(
     let mut ht_powers = vec![];
     ht.iter().for_each(|c| {
         // change ciphertexts to Evaluation representation for plaintext multiplication
-        let mut powers = powers_of_x(evaluator, c, 65536, sk, ek);
+        let mut powers = powers_of_x(evaluator, c, 65536, ek);
         powers.iter_mut().for_each(|c| {
             evaluator.ciphertext_change_representation(c, Representation::Evaluation);
         });
@@ -120,7 +124,7 @@ pub fn sort(
     for i in 0..values.len() {
         // get `i_th` ciphertext in descending order
         sorted_values.push(sort_equality_subroutine(
-            evaluator, i, &ht_powers, values, sk, ek,
+            evaluator, i, &ht_powers, values, ek,
         ));
     }
 
@@ -135,7 +139,6 @@ pub fn sort_equality_subroutine(
     i: usize,
     ht_powers: &[Vec<Ciphertext>],
     values: &[Ciphertext],
-    sk: &SecretKey,
     ek: &EvaluationKey,
 ) -> Ciphertext {
     let p = 65537;
@@ -213,23 +216,22 @@ pub fn sort_equality_subroutine(
     evaluator.relinearize(&res, ek)
 }
 
+/// Homomorphic x < y over Z_t with t = 65537, after Iliashenko and Zucca (PoPETs 2021).
+/// Returns a ciphertext holding 1 in every slot where x < y and 0 elsewhere, correct for
+/// inputs below t/2. Needs only the evaluation key: nothing here can decrypt.
 pub fn univariate_less_than(
     evaluator: &Evaluator,
     x: &Ciphertext,
     y: &Ciphertext,
     ek: &EvaluationKey,
-    sk: &SecretKey,
 ) -> Ciphertext {
     let z = evaluator.sub(x, y);
     let z_sq = evaluator.relinearize(&evaluator.mul(&z, &z), ek);
 
     // z^2..(z^2)^181
-    let mut m_powers = powers_of_x(evaluator, &z_sq, 181, sk, ek);
+    let mut m_powers = powers_of_x(evaluator, &z_sq, 181, ek);
     // (z^2)^181..((z^2)^181)^181
-    let k_powers = powers_of_x(evaluator, &m_powers[180], 181, sk, ek);
-
-    // decrypt_and_print(evaluator, &m_powers[180], sk, "m_powers[180]");
-    // decrypt_and_print(evaluator, &k_powers[180], sk, "k_powers[180]");
+    let k_powers = powers_of_x(evaluator, &m_powers[180], 181, ek);
 
     // ((z^2)^181)^181 * (z^2)^7 = z^65536; z^{p-1}
     let mut z_max_lazy = evaluator.mul_lazy(&k_powers[180], &m_powers[6]);
@@ -247,7 +249,7 @@ pub fn univariate_less_than(
         evaluator.ciphertext_change_representation(x, Representation::Evaluation);
     });
 
-    let coefficients = read_values("less_than.bin");
+    let coefficients = lt_coefficients();
 
     // evaluate g(x), where x = z^2
     let mut left_over = Ciphertext::placeholder();
@@ -258,7 +260,6 @@ pub fn univariate_less_than(
         let mut sum_m = Ciphertext::placeholder();
         for m_index in 0..181 {
             // degree of g(x) is (65537 - 3) / 2
-            // dbg!(181 * k_index + m_index);
             if 181 * k_index + m_index <= ((65537 - 3) / 2) {
                 let alpha = coefficients[(181 * k_index) + m_index];
 
@@ -278,16 +279,16 @@ pub fn univariate_less_than(
                     } else {
                         evaluator.add_assign(
                             &mut sum_m,
-                            &evaluator.mul_poly(&m_powers[m_index - 1], &pt_alpha.mul_poly_ref()),
+                            &evaluator.mul_poly(&m_powers[m_index - 1], pt_alpha.mul_poly_ref()),
                         );
                     }
                 }
             }
         }
 
-        if x_0_pt.is_some() {
-            // ad x^0 to sum_m
-            evaluator.add_assign_plaintext(&mut sum_m, &x_0_pt.unwrap());
+        // the x^0 term of this block
+        if let Some(pt) = x_0_pt {
+            evaluator.add_assign_plaintext(&mut sum_m, &pt);
         }
 
         if k_index == 0 {
@@ -314,9 +315,7 @@ pub fn univariate_less_than(
     evaluator.add_assign(&mut z_max_lazy, &z_gx);
 
     let res = evaluator.scale_and_round(&mut z_max_lazy);
-    let res = evaluator.relinearize(&res, ek);
-
-    res
+    evaluator.relinearize(&res, ek)
 }
 
 /// \alpha_i = \sum_{a = 1}^{\frac{p-1}{2}} a^{p - 1 - i}
@@ -351,7 +350,7 @@ pub fn compute_lt_coefficients(t: u64) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bfv::BfvParameters;
+    use bfv::{BfvParameters, SecretKey};
     use rand::thread_rng;
 
     #[test]
@@ -367,9 +366,6 @@ mod tests {
         let mx = modt_by_2.random_vec(params.degree, &mut rng);
         let my = modt_by_2.random_vec(params.degree, &mut rng);
 
-        println!("mx: {:?}", mx);
-        println!("my: {:?}", my);
-
         let ek = EvaluationKey::new(&params, &sk, &[0], &[], &[], &mut rng);
 
         let evaluator = Evaluator::new(params);
@@ -378,24 +374,49 @@ mod tests {
         let pty = evaluator.plaintext_encode(&my, Encoding::default());
         let x = evaluator.encrypt(&sk, &ptx, &mut rng);
         let y = evaluator.encrypt(&sk, &pty, &mut rng);
-        let mut res_ct = univariate_less_than(&evaluator, &x, &y, &ek, &sk);
-        res_ct = univariate_less_than(&evaluator, &x, &y, &ek, &sk);
-        res_ct = univariate_less_than(&evaluator, &x, &y, &ek, &sk);
-        // res_ct = univariate_less_than(&evaluator, &x, &y, &ek, &sk);
-        // res_ct = univariate_less_than(&evaluator, &x, &y, &ek, &sk);
-        // res_ct = univariate_less_than(&evaluator, &x, &y, &ek, &sk);
-        // res_ct = univariate_less_than(&evaluator, &x, &y, &ek, &sk);
+        let res_ct = univariate_less_than(&evaluator, &x, &y, &ek);
 
-        
         let res_m =
             evaluator.plaintext_decode(&evaluator.decrypt(&sk, &res_ct), Encoding::default());
-        println!("res_m: {:?}", res_m);
         let expected = mx
             .iter()
             .zip(my.iter())
             .map(|(x, y)| if x < y { 1 } else { 0 })
             .collect::<Vec<u64>>();
         assert_eq!(res_m, expected);
+    }
+
+    /// One comparison, sixteen slots, each slot an edge of the input domain: equal operands,
+    /// zero against one, the largest legal value against zero and against itself, and
+    /// neighbours one apart in both directions. Also pins the noise left after the circuit,
+    /// so a parameter change that silently eats the budget fails here instead of in a run.
+    #[test]
+    fn less_than_edges_and_noise_budget() {
+        let mut rng = thread_rng();
+
+        let mut params = BfvParameters::new(&[60; 10], 65537, 1 << 4);
+        params.enable_hybrid_key_switching(&[60; 3]);
+        let max = params.plaintext_modulus / 2 - 1; // 32767, the largest legal operand
+
+        let sk = SecretKey::random_with_params(&params, &mut rng);
+        let ek = EvaluationKey::new(&params, &sk, &[0], &[], &[], &mut rng);
+        let evaluator = Evaluator::new(params);
+
+        let mx = vec![0, 0, 1, max, max, 0, 7, 8, 100, 99, 5, max - 1, max, 1, 32000, 3];
+        let my = vec![0, 1, 0, max, 0, max, 8, 7, 99, 100, 5, max, max - 1, 1, 32001, 3];
+        let expected: Vec<u64> = mx.iter().zip(&my).map(|(x, y)| (x < y) as u64).collect();
+
+        let x = evaluator.encrypt(&sk, &evaluator.plaintext_encode(&mx, Encoding::default()), &mut rng);
+        let y = evaluator.encrypt(&sk, &evaluator.plaintext_encode(&my, Encoding::default()), &mut rng);
+        let res = univariate_less_than(&evaluator, &x, &y, &ek);
+
+        let bits = evaluator.plaintext_decode(&evaluator.decrypt(&sk, &res), Encoding::default());
+        assert_eq!(bits, expected);
+
+        // Q is ten 60-bit primes, about 600 bits. The circuit must leave real headroom.
+        let noise_bits = evaluator.measure_noise(&sk, &res);
+        println!("noise after comparison: {noise_bits} bits of ~600");
+        assert!(noise_bits < 540, "comparison left only {} bits of budget", 600 - noise_bits as i64);
     }
 
     // #[test]
