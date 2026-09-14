@@ -24,6 +24,7 @@ use bfv::{
     Ciphertext, Encoding, EvaluationKey, Evaluator, Modulus, PolyCache, PolyType, Representation,
 };
 use byteorder::{ByteOrder, LittleEndian};
+use rayon::prelude::*;
 
 use crate::powers_of_x;
 
@@ -154,7 +155,11 @@ impl LtTable {
 
 /// Σ c_j w^j by baby-step giant-step. `baby` holds w^1..w^b in evaluation form for the
 /// plaintext multiplies, `giant` holds (w^b)^1.. in coefficient form for the lazy products.
-fn eval_bsgs(
+/// `coeffs` must be a whole number of blocks of `b`; pad with zeros.
+///
+/// The blocks are independent until the final sum, so they run on rayon. That is where the
+/// time goes at any real degree: R plaintext multiplies against about 2√R ladder steps.
+pub(crate) fn eval_bsgs(
     evaluator: &Evaluator,
     baby: &[Ciphertext],
     giant: &[Ciphertext],
@@ -164,10 +169,10 @@ fn eval_bsgs(
     let b = baby.len();
     let n = evaluator.params().degree;
     let blocks = coeffs.len() / b;
-    let mut left_over = Ciphertext::placeholder();
-    let mut sum_k = Ciphertext::placeholder();
+    assert_eq!(blocks * b, coeffs.len(), "coefficients must be padded to whole blocks");
 
-    for k in 0..blocks {
+    // One block: c_0 + Σ_{m≥1} c_m w^m, in evaluation form.
+    let block_sum = |k: usize| -> Ciphertext {
         let block = &coeffs[k * b..(k + 1) * b];
         let x0 = evaluator.plaintext_encode(
             &vec![block[0]; n],
@@ -184,24 +189,27 @@ fn eval_bsgs(
             }
         }
         evaluator.add_assign_plaintext(&mut sum_m, &x0);
+        sum_m
+    };
 
-        if k == 0 {
-            evaluator.ciphertext_change_representation(&mut sum_m, Representation::Coefficient);
-            left_over = sum_m;
-        } else {
-            // sum_m is in evaluation form, giant in coefficient form: sum_m goes first.
-            let product = evaluator.mul_lazy(&sum_m, &giant[k - 1]);
-            if k == 1 {
-                sum_k = product;
-            } else {
-                evaluator.add_assign(&mut sum_k, &product);
-            }
-        }
-    }
-
+    let mut left_over = block_sum(0);
+    evaluator.ciphertext_change_representation(&mut left_over, Representation::Coefficient);
     if blocks == 1 {
         return left_over;
     }
+
+    // Blocks 1.. each multiply their giant power lazily, then everything is summed once.
+    // sum_m is in evaluation form and giant in coefficient form: sum_m goes first.
+    let sum_k = (1..blocks)
+        .into_par_iter()
+        .map(|k| evaluator.mul_lazy(&block_sum(k), &giant[k - 1]))
+        .reduce_with(|mut acc, p| {
+            evaluator.add_assign(&mut acc, &p);
+            acc
+        })
+        .expect("at least one giant block");
+
+    let mut sum_k = sum_k;
     let mut out = evaluator.relinearize(&evaluator.scale_and_round(&mut sum_k), ek);
     evaluator.add_assign(&mut out, &left_over);
     out
@@ -427,4 +435,6 @@ mod tests {
         }
     }
 }
+
+
 

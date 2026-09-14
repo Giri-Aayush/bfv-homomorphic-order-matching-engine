@@ -9,3 +9,4 @@ edition = "2021"
 bfv = {path = "./../../bfv/bfv"}
 byteorder = "1.4.3"
 rand = "0.8.5"
+rayon = "1"

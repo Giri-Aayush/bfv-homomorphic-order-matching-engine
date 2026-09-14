@@ -4,6 +4,7 @@ use bfv::{
     Ciphertext, Encoding, EvaluationKey, Evaluator, Modulus, PolyCache, PolyType, Representation,
 };
 use byteorder::{ByteOrder, LittleEndian};
+use rayon::prelude::*;
 use utils::store_values;
 
 pub mod packed;
@@ -14,56 +15,40 @@ pub mod utils;
 /// at build time so the binary and the tests need no data directory at run time.
 const LT_COEFFICIENTS_LE: &[u8] = include_bytes!("../../../order-match-engine/data/less_than.bin");
 
+/// Block size of the full circuit's baby-step giant-step split: 181² ≥ (t−1)/2.
+const LT_BABY: usize = 181;
+
+/// The g coefficients, padded to whole blocks of `LT_BABY` for `eval_bsgs`.
 fn lt_coefficients() -> &'static [u64] {
     static DECODED: OnceLock<Vec<u64>> = OnceLock::new();
     DECODED.get_or_init(|| {
         let mut out = vec![0u64; LT_COEFFICIENTS_LE.len() / 8];
         LittleEndian::read_u64_into(LT_COEFFICIENTS_LE, &mut out);
+        out.resize(out.len().div_ceil(LT_BABY) * LT_BABY, 0);
         out
     })
 }
 
+/// x^1 .. x^max, each relinearized. Built by doubling: once x^1..x^k are known, the next
+/// k powers are x^k times each of them, and those multiplications are independent, so each
+/// level runs on rayon. Depth is log2(max), the same as a squaring chain.
 pub fn powers_of_x(
     evaluator: &Evaluator,
     x: &Ciphertext,
     max: usize,
     ek: &EvaluationKey,
 ) -> Vec<Ciphertext> {
-    let dummy = Ciphertext::new(vec![], PolyType::Q, 0);
-    let mut values = vec![dummy; max];
-    let mut calculated = vec![0u64; max];
-    values[0] = x.clone();
-    calculated[0] = 1;
-
-    for i in (2..(max + 1)).rev() {
-        let mut exp = i;
-        let mut base_deg = 1;
-        let mut res_deg = 0;
-
-        while exp > 0 {
-            if exp & 1 == 1 {
-                let p_res_deg = res_deg;
-                res_deg += base_deg;
-                if res_deg != base_deg && calculated[res_deg - 1] == 0 {
-                    let tmp = evaluator.mul(&values[p_res_deg - 1], &values[base_deg - 1]);
-                    values[res_deg - 1] = evaluator.relinearize(&tmp, ek);
-                    calculated[res_deg - 1] = 1;
-                }
-            }
-            exp >>= 1;
-            if exp != 0 {
-                let p_base_deg = base_deg;
-                base_deg *= 2;
-                if calculated[base_deg - 1] == 0 {
-                    let tmp = evaluator.mul(&values[p_base_deg - 1], &values[p_base_deg - 1]);
-                    values[base_deg - 1] = evaluator.relinearize(&tmp, ek);
-
-                    calculated[base_deg - 1] = 1;
-                }
-            }
-        }
+    let mut values = vec![x.clone()];
+    while values.len() < max {
+        let k = values.len();
+        let take = k.min(max - k);
+        let top = &values[k - 1];
+        let next: Vec<Ciphertext> = values[..take]
+            .par_iter()
+            .map(|p| evaluator.relinearize(&evaluator.mul(top, p), ek))
+            .collect();
+        values.extend(next);
     }
-
     values
 }
 
@@ -230,92 +215,27 @@ pub fn univariate_less_than(
     let z = evaluator.sub(x, y);
     let z_sq = evaluator.relinearize(&evaluator.mul(&z, &z), ek);
 
-    // z^2..(z^2)^181
-    let mut m_powers = powers_of_x(evaluator, &z_sq, 181, ek);
-    // (z^2)^181..((z^2)^181)^181
-    let k_powers = powers_of_x(evaluator, &m_powers[180], 181, ek);
+    // z^2..(z^2)^181, then (z^2)^181..((z^2)^181)^181
+    let mut baby = powers_of_x(evaluator, &z_sq, LT_BABY, ek);
+    let giant = powers_of_x(evaluator, &baby[LT_BABY - 1], LT_BABY, ek);
 
-    // ((z^2)^181)^181 * (z^2)^7 = z^65536; z^{p-1}
-    let mut z_max_lazy = evaluator.mul_lazy(&k_powers[180], &m_powers[6]);
-    {
-        // coefficient for z^65536 = (p+1)/2
-        let pt = evaluator.plaintext_encode(
-            &vec![32769; evaluator.params().degree],
-            Encoding::simd(0, PolyCache::Mul(PolyType::PQ)),
-        );
-        evaluator.mul_poly_assign(&mut z_max_lazy, pt.mul_poly_ref());
+    // ((z^2)^181)^181 * (z^2)^7 = z^65536 = z^{t-1}, weighted by (t+1)/2
+    let mut z_max_lazy = evaluator.mul_lazy(&giant[LT_BABY - 1], &baby[6]);
+    let half = evaluator.plaintext_encode(
+        &vec![32769; evaluator.params().degree],
+        Encoding::simd(0, PolyCache::Mul(PolyType::PQ)),
+    );
+    evaluator.mul_poly_assign(&mut z_max_lazy, half.mul_poly_ref());
+
+    // g(z^2), with the baby powers in evaluation form for the plaintext multiplies
+    for p in baby.iter_mut() {
+        evaluator.ciphertext_change_representation(p, Representation::Evaluation);
     }
+    let g = ranged::eval_bsgs(evaluator, &baby, &giant, lt_coefficients(), ek);
 
-    // change m_powers to Evaluation representation for plaintext multiplications
-    m_powers.iter_mut().for_each(|x| {
-        evaluator.ciphertext_change_representation(x, Representation::Evaluation);
-    });
-
-    let coefficients = lt_coefficients();
-
-    // evaluate g(x), where x = z^2
-    let mut left_over = Ciphertext::placeholder();
-    let mut sum_k = Ciphertext::placeholder();
-    for k_index in 0..182 {
-        // m loop calculates x^0 + x + ... + x^181
-        let mut x_0_pt = None;
-        let mut sum_m = Ciphertext::placeholder();
-        for m_index in 0..181 {
-            // degree of g(x) is (65537 - 3) / 2
-            if 181 * k_index + m_index <= ((65537 - 3) / 2) {
-                let alpha = coefficients[(181 * k_index) + m_index];
-
-                if m_index == 0 {
-                    let pt_alpha = evaluator.plaintext_encode(
-                        &vec![alpha; evaluator.params().degree],
-                        Encoding::simd(0, PolyCache::AddSub(Representation::Evaluation)),
-                    );
-                    x_0_pt = Some(pt_alpha);
-                } else {
-                    let pt_alpha = evaluator.plaintext_encode(
-                        &vec![alpha; evaluator.params().degree],
-                        Encoding::simd(0, PolyCache::Mul(PolyType::Q)),
-                    );
-                    if m_index == 1 {
-                        sum_m = evaluator.mul_poly(&m_powers[m_index - 1], pt_alpha.mul_poly_ref());
-                    } else {
-                        evaluator.add_assign(
-                            &mut sum_m,
-                            &evaluator.mul_poly(&m_powers[m_index - 1], pt_alpha.mul_poly_ref()),
-                        );
-                    }
-                }
-            }
-        }
-
-        // the x^0 term of this block
-        if let Some(pt) = x_0_pt {
-            evaluator.add_assign_plaintext(&mut sum_m, &pt);
-        }
-
-        if k_index == 0 {
-            evaluator.ciphertext_change_representation(&mut sum_m, Representation::Coefficient);
-            left_over = sum_m;
-        } else {
-            // `sum_m` is in Evaluation representation and k_powers is in Coefficient  so pass `sum_m` is first operand
-            let product = evaluator.mul_lazy(&sum_m, &k_powers[k_index - 1]);
-            if k_index == 1 {
-                sum_k = product;
-            } else {
-                evaluator.add_assign(&mut sum_k, &product);
-            }
-        }
-    }
-
-    let mut sum_k = evaluator.relinearize(&evaluator.scale_and_round(&mut sum_k), ek);
-    evaluator.add_assign(&mut sum_k, &left_over);
-
-    // z * g(z^2)
-    let z_gx = evaluator.mul_lazy(&sum_k, &z);
-
-    // ((p+1)/2)z + z * g(z^2)
+    // ((t+1)/2) z^{t-1} + z * g(z^2)
+    let z_gx = evaluator.mul_lazy(&g, &z);
     evaluator.add_assign(&mut z_max_lazy, &z_gx);
-
     let res = evaluator.scale_and_round(&mut z_max_lazy);
     evaluator.relinearize(&res, ek)
 }
