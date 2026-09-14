@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use utils::store_values;
 
 pub mod packed;
+pub mod dkg;
 pub mod ranged;
 pub mod roles;
 pub mod utils;

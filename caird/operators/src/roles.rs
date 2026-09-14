@@ -85,6 +85,11 @@ pub struct PublicKey {
 }
 
 impl PublicKey {
+    /// (−(a·s + e), a) in evaluation form, from wherever it was produced.
+    pub(crate) fn from_parts(p0: Poly, p1: Poly) -> PublicKey {
+        PublicKey { p0, p1 }
+    }
+
     /// Encrypt an encoded plaintext at level 0.
     pub fn encrypt<R: CryptoRng + RngCore>(&self, evaluator: &Evaluator, pt: &Plaintext, rng: &mut R) -> Ciphertext {
         let params = evaluator.params();
@@ -126,6 +131,11 @@ pub struct Partial {
 }
 
 impl Share {
+    /// Parts `party` and `party + 1` of an additive three-way split, in evaluation form.
+    pub(crate) fn from_parts(party: usize, parts: [Poly; 2]) -> Share {
+        Share { party, parts }
+    }
+
     pub fn party(&self) -> usize {
         self.party
     }
