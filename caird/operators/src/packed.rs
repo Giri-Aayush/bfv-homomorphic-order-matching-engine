@@ -2,23 +2,31 @@
 //! matcher needs: prefix sums, row totals broadcast to every slot, and 0/1 masks.
 //!
 //! BFV batching lays the n slots out as two rows of n/2. This library's Galois keys rotate
-//! within a row and it has no row swap, so a "lane" here is one row and callers pack at most
-//! `lane_len` values per ciphertext. The second row is carried along and ignored.
+//! within a row and it has no row swap, so a lane lives in one row. It uses only the first
+//! half of that row, `lane_len` = n/4 slots, so that a right rotation by less than a lane
+//! wraps zeros in from the empty half. That is what lets `prefix_sum` run without a mask:
+//! rotations add a little additive noise, a step mask multiplies noise by about t·√n, and
+//! at n = 2^15 fourteen of those ate the whole budget. The second row is carried unused.
 
 use bfv::{Ciphertext, Encoding, EvaluationKey, Evaluator, PolyCache, PolyType, Representation};
 
-/// Usable slots per ciphertext: one row of the slot matrix.
-pub fn lane_len(evaluator: &Evaluator) -> usize {
+/// Slots per row of the slot matrix, which is as far as a rotation reaches.
+fn row_len(evaluator: &Evaluator) -> usize {
     evaluator.params().degree / 2
 }
 
+/// Values a caller may pack per ciphertext: the first half of a row, from slot 0.
+pub fn lane_len(evaluator: &Evaluator) -> usize {
+    row_len(evaluator) / 2
+}
+
 /// The rotation indices `prefix_sum` and `broadcast_sum` need keys for: right shifts by
-/// 1, 2, 4, ... below the lane length. Pass these as `rtg_indices` to `EvaluationKey::new`.
+/// 1, 2, 4, ... below the row length. Pass these as `rtg_indices` to `EvaluationKey::new`.
 pub fn rotation_indices(evaluator: &Evaluator) -> Vec<isize> {
-    let lane = lane_len(evaluator);
+    let row = row_len(evaluator);
     (0..)
         .map(|k| 1usize << k)
-        .take_while(|&s| s < lane)
+        .take_while(|&s| s < row)
         .map(|s| -(s as isize))
         .collect()
 }
@@ -36,31 +44,30 @@ pub fn mask(evaluator: &Evaluator, ct: &Ciphertext, keep: &[bool]) -> Ciphertext
     out
 }
 
-/// In-row prefix sums: slot i becomes the sum of slots 0..=i of its row.
+/// Prefix sums over a lane: slot i becomes the sum of slots 0..=i, for i below the lane
+/// length. Slots at or past the lane are unspecified.
 ///
-/// log2(lane) rounds. A right rotation by s brings slot i-s into slot i and wraps the row
-/// tail into the first s slots; the mask drops that wrap before the add.
+/// Doubling with right rotations by 1, 2, 4, ... below the lane length, and no masks. With
+/// the top half of the row zero, every wrap brings in zeros, and the window each slot sums
+/// covers the whole lane by the last step. Additive noise only, so it works at any degree.
 pub fn prefix_sum(evaluator: &Evaluator, ct: &Ciphertext, ek: &EvaluationKey) -> Ciphertext {
-    let n = evaluator.params().degree;
     let lane = lane_len(evaluator);
     let mut acc = ct.clone();
     let mut shift = 1;
     while shift < lane {
         let rotated = evaluator.rotate(&acc, -(shift as isize), ek);
-        let keep: Vec<bool> = (0..n).map(|i| i % lane >= shift).collect();
-        let carried = mask(evaluator, &rotated, &keep);
-        acc = evaluator.add(&acc, &carried);
+        acc = evaluator.add(&acc, &rotated);
         shift <<= 1;
     }
     acc
 }
 
-/// Every slot of a row becomes that row's sum. log2(lane) rotate-and-adds, no masks.
+/// Every slot of a row becomes that row's sum. log2(row) rotate-and-adds, no masks.
 pub fn broadcast_sum(evaluator: &Evaluator, ct: &Ciphertext, ek: &EvaluationKey) -> Ciphertext {
-    let lane = lane_len(evaluator);
+    let row = row_len(evaluator);
     let mut acc = ct.clone();
     let mut shift = 1;
-    while shift < lane {
+    while shift < row {
         let rotated = evaluator.rotate(&acc, -(shift as isize), ek);
         acc = evaluator.add(&acc, &rotated);
         shift <<= 1;
@@ -104,9 +111,9 @@ mod tests {
     }
 
     #[test]
-    fn rotation_indices_are_right_shifts_below_the_lane() {
+    fn a_lane_is_half_a_row_and_keys_cover_the_row() {
         let f = Fixture::new();
-        assert_eq!(lane_len(&f.evaluator), 8);
+        assert_eq!(lane_len(&f.evaluator), 4);
         assert_eq!(rotation_indices(&f.evaluator), vec![-1, -2, -4]);
     }
 
@@ -121,20 +128,17 @@ mod tests {
     }
 
     #[test]
-    fn prefix_sum_matches_plaintext_in_both_rows() {
+    fn prefix_sum_matches_plaintext_within_the_lane() {
         let mut f = Fixture::new();
-        let m: Vec<u64> = vec![5, 3, 0, 7, 1, 1, 2, 4, 10, 20, 30, 40, 50, 60, 70, 80];
+        // one lane of four in row 0, another in row 1, top halves zero
+        let m: Vec<u64> = vec![5, 3, 0, 7, 0, 0, 0, 0, 10, 20, 30, 40, 0, 0, 0, 0];
         let ct = f.enc(&m);
         let out = f.dec(&prefix_sum(&f.evaluator, &ct, &f.ek));
-        let mut want = vec![0u64; 16];
-        for row in 0..2 {
-            let mut run = 0;
-            for i in 0..8 {
-                run += m[row * 8 + i];
-                want[row * 8 + i] = run;
-            }
-        }
-        assert_eq!(out, want);
+        assert_eq!(&out[..4], &[5, 8, 8, 15]);
+        assert_eq!(&out[8..12], &[10, 30, 60, 100]);
+        let noise = f.evaluator.measure_noise(&f.sk, &prefix_sum(&f.evaluator, &ct, &f.ek));
+        let fresh = f.evaluator.measure_noise(&f.sk, &ct);
+        assert!(noise < fresh + 40, "prefix sum should add only key-switching noise, added {}", noise - fresh);
     }
 
     #[test]
@@ -152,9 +156,9 @@ mod tests {
     #[test]
     fn one_comparison_gives_every_fill_bit_and_fits_the_budget() {
         let mut f = Fixture::new();
-        // buys 1250 3400 800 2900 1900 4200 640 2750, sells summing to 9100
-        let buys = vec![1250, 3400, 800, 2900, 1900, 4200, 640, 2750, 0, 0, 0, 0, 0, 0, 0, 0];
-        let sells = vec![2000, 1100, 450, 3200, 700, 1650, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        // one lane of buys, sells summing to 5450 in another ciphertext's lane
+        let buys = vec![1250, 3400, 800, 2900, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let sells = vec![2000, 1100, 450, 1900, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let buys_ct = f.enc(&buys);
         let sells_ct = f.enc(&sells);
 
@@ -164,8 +168,8 @@ mod tests {
         let over = univariate_less_than(&f.evaluator, &sell_total, &prefix, &f.ek);
 
         let bits = f.dec(&over);
-        // prefixes: 1250 4650 5450 8350 10250 14450 15090 17840 against 9100
-        assert_eq!(&bits[..8], &[0, 0, 0, 0, 1, 1, 1, 1]);
+        // prefixes: 1250 4650 5450 8350 against 5450: 5450 is not over
+        assert_eq!(&bits[..4], &[0, 0, 0, 1]);
         let noise = f.evaluator.measure_noise(&f.sk, &over);
         println!("noise after prefix + broadcast + comparison: {noise} bits of ~600");
         assert!(noise < 540, "only {} bits of budget left", 600 - noise as i64);

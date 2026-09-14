@@ -13,7 +13,7 @@
 //! order, the boundary order's fill but never its size, and nothing at all about the orders
 //! behind it.
 
-use crate::{phase, read_book, Book, Engine, Order, Report, SLOTS, T};
+use crate::{fail, phase, read_book, Book, Engine, Order, Report, SECURE_DEGREE};
 use bfv::Ciphertext;
 use operators::packed::{broadcast_sum, lane_len, mask, prefix_sum};
 use operators::ranged::{compare_ranged, LtTable};
@@ -82,14 +82,19 @@ impl Circuit {
     }
 
     /// One slot per order: 1 where x < y. The ranged circuit also has an equal marker, and
-    /// equal is not less, so both decode the same way.
-    fn less_than(&self, engine: &mut Engine, x: &Ciphertext, y: &Ciphertext) -> Vec<bool> {
-        let ct = match self {
-            Circuit::Ranged(t) => compare_ranged(&engine.evaluator, x, y, &engine.ek, t),
-            Circuit::Full => univariate_less_than(&engine.evaluator, x, y, &engine.ek),
+    /// equal is not less, so both decode the same way. Any other value means the noise
+    /// budget was exceeded and the run stops rather than reporting fills that are not real.
+    fn less_than(&self, engine: &mut Engine, x: &Ciphertext, y: &Ciphertext, slots: usize) -> Vec<bool> {
+        let (ct, legal): (Ciphertext, &[u64]) = match self {
+            Circuit::Ranged(t) => (compare_ranged(&engine.evaluator, x, y, &engine.ek, t), &[0, 1, t.equal_marker()]),
+            Circuit::Full => (univariate_less_than(&engine.evaluator, x, y, &engine.ek), &[0, 1]),
         };
         engine.comparisons += 1;
-        engine.decrypt_slots(&ct).into_iter().map(|v| v == 1).collect()
+        let values = engine.decrypt_slots(&ct);
+        if let Some(bad) = values[..slots].iter().find(|v| !legal.contains(v)) {
+            fail(format!("comparison returned {bad}, which is not a legal output: noise budget exceeded at n = {}", engine.degree));
+        }
+        values.into_iter().map(|v| v == 1).collect()
     }
 }
 
@@ -116,7 +121,7 @@ fn fill_side(engine: &mut Engine, side: &PackedSide, other_total: &Ciphertext, c
         }
 
         // over[i] where cumulative volume through order i exceeds the other side's total.
-        let over = circuit.less_than(engine, other_total, &prefix);
+        let over = circuit.less_than(engine, other_total, &prefix, n);
         let whole: Vec<bool> = (0..n).map(|i| !over[i]).collect();
         let boundary = (0..n).find(|&i| over[i]);
 
@@ -164,22 +169,27 @@ fn print_side(side: &PackedSide, fills: &[Fill], against: &str) {
     }
 }
 
-pub fn match_book(path: &str) -> Report {
+pub fn match_book(path: &str, degree: usize) -> Report {
     let started = Instant::now();
     let mut clock = Instant::now();
     let Book { pair, buys, sells, range } = read_book(path);
     let n_buys = buys.len();
     let n_sells = sells.len();
     let circuit = Circuit::for_range(range);
+    if degree == SECURE_DEGREE && matches!(circuit, Circuit::Full) {
+        fail(format!(
+            "{path}: range {range} has no shipped comparison table, and at n = {degree} the full circuit exceeds the noise budget. Build one with `operators ranged <R>`."
+        ));
+    }
 
+    let mut engine = Engine::new(true, degree);
+    let lane = lane_len(&engine.evaluator);
+    let rotations = operators::packed::rotation_indices(&engine.evaluator).len();
     println!();
     println!("bfv order matching   {pair}   {n_buys} buys, {n_sells} sells   {path}   packed");
-    println!("params               n={SLOTS}  t={T}  Q=10x60-bit  P=3x60-bit   (toy degree, see README)");
+    println!("{}", engine.params_line());
     println!();
-
-    let mut engine = Engine::new(true);
-    let lane = lane_len(&engine.evaluator);
-    phase("keys", "secret key, evaluation key, 3 rotation keys", &mut clock, "");
+    phase("keys", &format!("secret key, evaluation key, {rotations} rotation keys"), &mut clock, "");
 
     let buy_side = PackedSide::pack(&mut engine, "buy", buys, lane);
     let sell_side = PackedSide::pack(&mut engine, "sell", sells, lane);
@@ -261,24 +271,34 @@ mod tests {
     #[test]
     fn toy_book() {
         assert_eq!(
-            match_book("order.json"),
-            Report { matched: 21, smaller_total: 21, comparisons: 2, fills_decrypted: 10, unfilled: 2 }
+            match_book("order.json", crate::TOY_DEGREE),
+            Report { matched: 21, smaller_total: 21, comparisons: 3, fills_decrypted: 10, unfilled: 2 }
         );
     }
 
     #[test]
     fn eth_usdc_two_lanes_per_side() {
         assert_eq!(
-            match_book("books/eth-usdc.json"),
-            Report { matched: 13730, smaller_total: 13730, comparisons: 3, fills_decrypted: 16, unfilled: 5 }
+            match_book("books/eth-usdc.json", crate::TOY_DEGREE),
+            Report { matched: 13730, smaller_total: 13730, comparisons: 5, fills_decrypted: 16, unfilled: 5 }
         );
     }
 
     #[test]
     fn btc_usdt_sell_side_larger() {
         assert_eq!(
-            match_book("books/btc-usdt.json"),
+            match_book("books/btc-usdt.json", crate::TOY_DEGREE),
             Report { matched: 2875, smaller_total: 2875, comparisons: 2, fills_decrypted: 7, unfilled: 2 }
+        );
+    }
+
+    /// About twenty seconds on eleven threads, so not in the default run: `cargo test --release -- --ignored`.
+    #[test]
+    #[ignore]
+    fn small_lots_at_secure_degree() {
+        assert_eq!(
+            match_book("books/small-lots.json", SECURE_DEGREE),
+            Report { matched: 2780, smaller_total: 2780, comparisons: 2, fills_decrypted: 14, unfilled: 0 }
         );
     }
 
@@ -293,15 +313,15 @@ mod tests {
     #[test]
     fn small_lots_use_the_ranged_circuit() {
         assert_eq!(
-            match_book("books/small-lots.json"),
-            Report { matched: 2780, smaller_total: 2780, comparisons: 2, fills_decrypted: 14, unfilled: 0 }
+            match_book("books/small-lots.json", crate::TOY_DEGREE),
+            Report { matched: 2780, smaller_total: 2780, comparisons: 4, fills_decrypted: 14, unfilled: 0 }
         );
     }
 
     #[test]
     fn equal_remainder_fills_exactly_then_partial_of_zero() {
         assert_eq!(
-            match_book("books/equal-remainder.json"),
+            match_book("books/equal-remainder.json", crate::TOY_DEGREE),
             Report { matched: 500, smaller_total: 500, comparisons: 2, fills_decrypted: 4, unfilled: 1 }
         );
     }

@@ -10,8 +10,12 @@ use std::time::Instant;
 
 /// Plaintext modulus. A Fermat prime, which the comparison circuit relies on.
 const T: u64 = 65537;
-/// Ring degree. This is the library's floor and offers no lattice security; see README.
-const SLOTS: usize = 1 << 4;
+/// Toy ring degree: the library's floor, no lattice security, fast enough to iterate on.
+const TOY_DEGREE: usize = 1 << 4;
+/// The largest degree batching allows at this t, since t − 1 = 2^16 must be a multiple of
+/// 2n. With log2(QP) = 780 and a ternary secret of weight n/2 this is roughly 128-bit; see
+/// README for the caveat on the secret's weight.
+const SECURE_DEGREE: usize = 1 << 15;
 
 /// An order in the book file: either a bare quantity or `{"id": "...", "qty": N}`.
 /// Ids are not secret and appear in the report. Quantities are the values that get encrypted.
@@ -58,6 +62,7 @@ struct Engine {
     sk: SecretKey,
     ek: EvaluationKey,
     rng: ThreadRng,
+    degree: usize,
     comparisons: usize,
     decryptions: usize,
 }
@@ -65,16 +70,21 @@ struct Engine {
 impl Engine {
     /// The sequential walk needs relinearization at level 0 and nothing else. The packed
     /// matcher also needs the rotation keys behind prefix sums and broadcast totals.
-    fn new(with_rotations: bool) -> Self {
+    fn new(with_rotations: bool, degree: usize) -> Self {
         let mut rng = thread_rng();
-        let mut params = BfvParameters::new(&[60; 10], T, SLOTS);
+        let mut params = BfvParameters::new(&[60; 10], T, degree);
         params.enable_hybrid_key_switching(&[60; 3]);
         let sk = SecretKey::random_with_params(&params, &mut rng);
         let evaluator = Evaluator::new(params);
         let rotations = if with_rotations { operators::packed::rotation_indices(&evaluator) } else { vec![] };
         let levels = vec![0; rotations.len()];
         let ek = EvaluationKey::new(evaluator.params(), &sk, &[0], &levels, &rotations, &mut rng);
-        Engine { evaluator, sk, ek, rng, comparisons: 0, decryptions: 0 }
+        Engine { evaluator, sk, ek, rng, degree, comparisons: 0, decryptions: 0 }
+    }
+
+    fn params_line(&self) -> String {
+        let note = if self.degree == SECURE_DEGREE { "roughly 128-bit, see README" } else { "toy degree, see README" };
+        format!("params               n={}  t={T}  Q=10x60-bit  P=3x60-bit   ({note})", self.degree)
     }
 
     /// Encrypt one quantity into slot 0.
@@ -84,7 +94,7 @@ impl Engine {
 
     /// Encrypt up to a lane of quantities, one per slot from slot 0. Remaining slots are zero.
     fn encrypt_lane(&mut self, quantities: &[u64]) -> Ciphertext {
-        let mut slots = vec![0u64; SLOTS];
+        let mut slots = vec![0u64; self.degree];
         slots[..quantities.len()].copy_from_slice(quantities);
         let pt = self.evaluator.plaintext_encode(&slots, Encoding::default());
         self.evaluator.encrypt(&self.sk, &pt, &mut self.rng)
@@ -203,12 +213,11 @@ fn match_book(path: &str) -> Report {
     let mut clock = Instant::now();
     let Book { pair, buys: buy_orders, sells: sell_orders, .. } = read_book(path);
 
+    let mut engine = Engine::new(false, TOY_DEGREE);
     println!();
     println!("bfv order matching   {pair}   {} buys, {} sells   {path}", buy_orders.len(), sell_orders.len());
-    println!("params               n={SLOTS}  t={T}  Q=10x60-bit  P=3x60-bit   (toy degree, see README)");
+    println!("{}", engine.params_line());
     println!();
-
-    let mut engine = Engine::new(false);
     phase("keys", "secret key and evaluation key", &mut clock, "");
 
     // Ids stay in the clear. Quantities are encrypted and the plaintext copies dropped, so from
@@ -296,19 +305,26 @@ fn match_book(path: &str) -> Report {
 
 fn main() {
     let mut packed = false;
+    let mut secure = false;
     let mut path = "order.json".to_string();
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--packed" => packed = true,
+            // Secure parameters imply the packed matcher: the walk's full-domain circuit does
+            // not fit the noise budget at n = 2^15, and the packed one only needs a table.
+            "--secure" => {
+                secure = true;
+                packed = true;
+            }
             "--help" | "-h" => {
-                eprintln!("usage: order-match-engine [--packed] [book.json]");
+                eprintln!("usage: order-match-engine [--packed] [--secure] [book.json]");
                 std::process::exit(0)
             }
             other => path = other.to_string(),
         }
     }
     if packed {
-        packed::match_book(&path);
+        packed::match_book(&path, if secure { SECURE_DEGREE } else { TOY_DEGREE });
     } else {
         match_book(&path);
     }
