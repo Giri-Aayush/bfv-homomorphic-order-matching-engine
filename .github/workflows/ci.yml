@@ -21,6 +21,8 @@ jobs:
       - name: engine, every shipped book
         working-directory: order-match-engine
         run: cargo test --release
-      - name: engine, demo run
+      - name: engine, demo run, both modes
         working-directory: order-match-engine
-        run: cargo run --release -- books/eth-usdc.json
+        run: |
+          cargo run --release -- books/eth-usdc.json
+          cargo run --release -- --packed books/eth-usdc.json

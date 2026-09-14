@@ -27,17 +27,20 @@ Requires a Rust toolchain with edition 2024 support (Rust 1.85 or later). With n
 Pass a path to run a different book. Orders can be bare quantities or `{"id": "...", "qty": N}` objects. Ids are not secret and appear in the report. Quantities are what gets encrypted.
 
 ```sh
-cargo run --release -- books/eth-usdc.json
+cargo run --release -- books/eth-usdc.json            # the sequential walk, one comparison per order
+cargo run --release -- --packed books/eth-usdc.json   # packed, one comparison per lane of 8 orders
 ```
+
+The two modes are described below and print the same shape of report, so a book can be run both ways and compared line by line.
 
 ### Sample books
 
-| Book | What it exercises |
-| --- | --- |
-| `order.json` | The toy book: 36 against 21, three buys fill, 18 units match. |
-| `books/eth-usdc.json` | Eleven buys with ids against ten sells. Three buys fail at their turn and smaller buys after each of them still fill: 13,715 of 13,730 across 12 comparisons. |
-| `books/btc-usdt.json` | The sell side is larger, so sells are walked against the encrypted buy remainder. |
-| `books/equal-remainder.json` | Two orders exactly equal the remainder at their turn and do not fill, because the comparison is strict. |
+| Book | What it exercises | Walk | Packed |
+| --- | --- | --- | --- |
+| `order.json` | The toy book: 36 against 21. | 7 comparisons, 18 of 21 | 2 comparisons, 21 of 21 |
+| `books/eth-usdc.json` | Eleven buys with ids against ten sells, two lanes per side. | 12 comparisons, 13,715 of 13,730 | 3 comparisons, 13,730 of 13,730 |
+| `books/btc-usdt.json` | The sell side is larger. | 6 comparisons, 2,540 of 2,875 | 2 comparisons, 2,875 of 2,875 |
+| `books/equal-remainder.json` | An order exactly equals what is left at its turn. | The walk's strict less-than leaves it unfilled | Fills exactly, then a partial of zero |
 
 The engine refuses a book whose side total reaches t/2 = 32768, since the comparison circuit is only correct below that bound. It also refuses an empty side, a zero quantity, and a duplicate id. All of these are the submitter's checks, done on plaintext the submitter already holds, before anything is encrypted.
 
@@ -48,7 +51,7 @@ The engine refuses a book whose side total reaches t/2 = 32768, since the compar
 (cd order-match-engine && cargo test --release)  # every shipped book, results pinned
 ```
 
-The operators crate has two tests: a random-vector comparison across all 16 slots, and a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit. The engine crate runs every book in `books/` plus `order.json` and pins five numbers for each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, the walk, or the decryption accounting shows up as a diff in one of those. CI runs both on every push.
+The operators crate has seven tests: a random-vector comparison across all 16 slots, a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit, and the packed primitives (mask, prefix sum, broadcast total) each checked against plaintext, with a final test that runs prefix, broadcast and comparison together and pins that noise too. The engine crate runs every book in both modes and pins five numbers for each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, either matcher, or the decryption accounting shows up as a diff in one of those. CI runs all of it on every push.
 
 ## What the engine does
 
@@ -62,6 +65,18 @@ The matching model is volume crossing on quantities, not a price-time-priority l
 
 With the sample `order.json` (buy sum 36, sell sum 21), the run fills buy orders 1 through 3 (18 units). Orders 4 to 6 are each 6 against a remainder of 3 and stay unfilled. The strict less-than also means an order exactly equal to the remainder would not fill, and partial fills are not supported.
 
+### Packed matching (`--packed`)
+
+The walk spends one comparison and one decrypted bit per order. The packed matcher spends one comparison per lane of eight orders and decrypts one bit vector for it.
+
+1. Each side is packed into lanes: up to eight quantities per ciphertext, one per slot. This library's rotations act within a row of n/2 slots and it has no row swap, so a lane is one row and the second row rides along unused.
+2. Each side's total is broadcast to every slot by three rotate-and-adds, and stays encrypted.
+3. For each lane, cumulative volume is a prefix sum by three masked rotations, plus the total of the lanes before it. One `univariate_less_than(other total, prefix)` gives, for every order in the lane, whether the cumulative volume through it already exceeds what the other side has. That bit vector is decrypted.
+4. Orders before the first set bit fill whole. Their quantities are revealed through a plaintext mask, so the decryption shows nothing else. The first set bit is the boundary order: it fills with what is left, computed as total minus prefix plus its own quantity, masked to that one slot and decrypted. Its full size is never revealed. Orders after it, and every later lane, are not computed or decrypted at all.
+5. The other side is processed the same way. If it is the smaller side, no bit is ever set and it fills whole.
+
+That is time priority with partial fills. The smaller side is filled to the unit on every book, and the equal-remainder case that the walk leaves unfilled fills exactly. It also leaks less than the walk: the bit vector says where the boundary is and nothing more, the boundary order's size stays encrypted, and nothing about orders behind it is learned, not even a lower bound. On `books/eth-usdc.json` that is 3 comparisons and 16 revealed quantities against the walk's 12 and 18.
+
 ## Architecture
 
 Three crates, wired together by path dependencies:
@@ -69,7 +84,7 @@ Three crates, wired together by path dependencies:
 | Crate | Path | Role |
 | --- | --- | --- |
 | `order-match-engine` | `order-match-engine/` | Binary. Loads a book, runs the matching flow above, counts what it decrypts. |
-| `operators` | `caird/operators/` | Homomorphic comparison: `univariate_less_than`, `powers_of_x`, an encrypted `sort`, and the coefficient precomputation `compute_lt_coefficients`. |
+| `operators` | `caird/operators/` | Homomorphic comparison: `univariate_less_than`, `powers_of_x`, an encrypted `sort`, the coefficient precomputation `compute_lt_coefficients`, and the `packed` module (mask, prefix sum, broadcast total by rotation). |
 | `bfv` | `bfv/bfv/` | The BFV scheme itself: RNS polynomial arithmetic, NTT (via `concrete-ntt`, optional Intel HEXL), encryption, relinearization, hybrid key switching. Vendored from Janmajaya Mall's `bfv` library (MIT license in `bfv/LICENSE`). |
 
 ```mermaid
@@ -147,8 +162,8 @@ So the claim that holds is narrower than "zero plaintext": the arithmetic on ord
 
 Measured on an Apple Silicon Mac (arm64), `--release`, at the toy ring degree n = 16:
 
-- Toy book (6 buys, 6 sells, 7 homomorphic comparisons, 9 decrypted fills): about 0.46 s wall clock.
-- `books/eth-usdc.json` (11 buys, 10 sells, 12 comparisons, 18 decrypted fills): about 0.75 s. Each comparison is roughly 55 ms of that, and the binary prints per-phase timings on every run.
+- Toy book, walk (7 comparisons, 9 decrypted fills): about 0.46 s wall clock. Packed (2 comparisons): about 0.14 s.
+- `books/eth-usdc.json`, walk (12 comparisons, 18 decrypted fills): about 0.75 s. Packed (3 comparisons, 16 revealed quantities): about 0.20 s. Each comparison is roughly 55 ms, and the binary prints per-phase timings on every run.
 - `less_than_works` test (one comparison on fresh ciphertexts, all 16 slots at once): about 0.11 s including key generation.
 
 These numbers do not transfer to secure parameters. Every polynomial operation scales at least with n log n, and a secure ring degree for a 600-bit modulus is three orders of magnitude larger than 16.
@@ -157,10 +172,10 @@ These numbers do not transfer to secure parameters. Every polynomial operation s
 
 - **The parameters are insecure.** Ring degree 16 with a 600-bit ciphertext modulus offers no meaningful lattice security. Standard estimates call for degrees in the tens of thousands at this modulus size. The library's own assertion floor is `degree >= 16` and this project runs at that floor. Treat every ciphertext in this repo as toy.
 - **Not zero plaintext.** See the scorecard above: comparison bits are decrypted mid-protocol, filled quantities are decrypted for the report, and the secret key lives in the matching process itself.
-- **The fill pattern leaks bounds.** The sequence of comparison bits together with the decrypted fills gives a lower bound on every unfilled quantity, and reveals the smaller side's total exactly. Volume crossing in input order cannot avoid this. A prefix-sum formulation that decrypts one fill vector at the end would leak less.
+- **The walk's fill pattern leaks bounds.** In the sequential walk, the comparison bits together with the decrypted fills give a lower bound on every unfilled quantity. The packed matcher does not have this: past the boundary nothing is computed, so nothing is bounded. Both modes reveal the smaller side's total, since all of its fills are printed.
 - **Quantities only, no prices.** Orders are u64 quantities with an optional id. There is no price, no limit book, and no time priority beyond input order. The `pair` field is only a label.
-- **Greedy, strict, no partial fills.** Orders on the larger side fill first-come against the remaining volume, the strict less-than leaves an order unfilled even when it exactly equals the remainder, and an order can only fill whole. The sample run matches 18 of 21 available units.
-- **Input domain is bounded.** Comparison correctness requires values below t/2, about 32768, and the summed side must also stay below that bound. The engine checks this on load and refuses the book otherwise. Slot capacity is not exploited by the engine: each order occupies one slot of a 16-slot ciphertext, although the comparison circuit itself is SIMD and the test exercises all 16 slots.
+- **The walk is greedy, strict, and whole-fill only.** In the sequential walk, orders on the larger side fill first-come against the remaining volume, the strict less-than leaves an order unfilled even when it exactly equals the remainder, and an order can only fill whole. The sample run matches 18 of 21. The packed matcher replaces this with time priority and a partial fill at the boundary, and matches 21 of 21.
+- **Input domain is bounded.** Comparison correctness requires values below t/2, about 32768, and the summed side must also stay below that bound. The engine checks this on load and refuses the book otherwise. The walk uses one slot per ciphertext. The packed matcher uses eight, one row, because the library cannot rotate across rows.
 - **Depth budget is spent on comparison.** One `univariate_less_than` materializes two ladders of 181 powers each, one relinearized ciphertext multiplication per power, with a critical path of about eight squarings per ladder, all against a 10-prime modulus chain with no modulus switching in the call path. Measured: a single comparison leaves about 360 bits of noise in a roughly 600-bit modulus, so a second comparison on its output would not decrypt correctly. That is the concrete reason the walk decrypts a bit between steps rather than chaining. The test `less_than_edges_and_noise_budget` pins the figure.
 - **No benchmarks for the engine.** The `bfv` library ships Criterion benches for its primitives. The matching pipeline prints per-phase wall-clock times but has no benches.
 - **Not production software.** Single binary, secret key generated per run and never persisted, no serialization of ciphertexts (the `serialize` feature of the library is unused by the engine).
