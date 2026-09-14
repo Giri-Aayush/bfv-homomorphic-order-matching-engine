@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            caird/operators
+            order-match-engine
+      - name: operators, comparison circuit
+        working-directory: caird/operators
+        run: cargo test --release
+      - name: engine, every shipped book
+        working-directory: order-match-engine
+        run: cargo test --release
+      - name: engine, demo run
+        working-directory: order-match-engine
+        run: cargo run --release -- books/eth-usdc.json
