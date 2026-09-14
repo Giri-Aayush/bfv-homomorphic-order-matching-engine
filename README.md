@@ -29,7 +29,7 @@ Pass a path to run a different book. Orders can be bare quantities or `{"id": ".
 ```sh
 cargo run --release -- books/eth-usdc.json             # the sequential walk, one comparison per order
 cargo run --release -- --packed books/eth-usdc.json    # packed, one comparison per lane of orders
-cargo run --release -- --secure books/small-lots.json  # packed at n = 2^15, about 16 s and 2.2 GB
+cargo run --release -- --secure books/small-lots.json  # packed at n = 2^15, about 21 s and 2.2 GB
 ```
 
 The two matchers are described below and print the same shape of report, so a book can be run both ways and compared line by line. `--secure` is the packed matcher at a real ring degree, and it refuses a book whose range has no shipped comparison table, since the full circuit does not fit the noise budget at that degree.
@@ -42,7 +42,7 @@ The two matchers are described below and print the same shape of report, so a bo
 | `books/eth-usdc.json` | Eleven buys with ids against ten sells, three lanes per side at the toy degree. | 12 comparisons, 13,715 of 13,730 | 5 comparisons, 13,730 of 13,730 |
 | `books/btc-usdt.json` | The sell side is larger. | 6 comparisons, 2,540 of 2,875 | 2 comparisons, 2,875 of 2,875 |
 | `books/equal-remainder.json` | An order exactly equals what is left at its turn. | The walk's strict less-than leaves it unfilled | Fills exactly, then a partial of zero |
-| `books/small-lots.json` | Eight buys against six sells with both totals below 4,096, so the packed matcher uses the shipped 4,096 comparison table. Also the `--secure` demo. | 9 comparisons, 2,645 of 2,780, 0.16 s | 4 comparisons, 2,780 of 2,780, 0.04 s |
+| `books/small-lots.json` | Eight buys against six sells with both totals below 4,096, so the packed matcher uses the shipped 4,096 comparison table. Also the `--secure` demo. | 9 comparisons, 2,645 of 2,780, 0.17 s | 4 comparisons, 2,780 of 2,780, 0.04 s |
 
 The engine refuses a book whose side total reaches t/2 = 32768, since the comparison circuit is only correct below that bound. It also refuses an empty side, a zero quantity, and a duplicate id. All of these are the submitter's checks, done on plaintext the submitter already holds, before anything is encrypted.
 
@@ -53,7 +53,14 @@ The engine refuses a book whose side total reaches t/2 = 32768, since the compar
 (cd order-match-engine && cargo test --release)  # every shipped book, results pinned
 ```
 
-The operators crate has eighteen tests and the engine eleven plus one ignored: a random-vector comparison across all 16 slots, a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit, the packed primitives (mask, prefix sum, broadcast total) each checked against plaintext with a final test that runs prefix, broadcast and comparison together and pins that noise too, the ranged comparison: its tables checked at every interpolation point, both evaluators checked exhaustively on all 576 pairs below 24, agreement with the full circuit on random inputs below 4,096, and the shipped tables loaded and exercised. The roles: public-key ciphertexts decrypt under the secret and cost only a few bits more, a comparison on them fits the budget, all four orderings of party pairs reconstruct a reference decryption, and one party alone does not. And the collective key generation, as listed in its section. The engine crate runs every book in both modes and pins five numbers for each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, either matcher, or the decryption accounting shows up as a diff in one of those. The ignored test is the small-lots book at n = 2^15, about 16 s on eleven threads: `cargo test --release -- --ignored`. CI runs all of it on every push, the secure run included.
+The operators crate has eighteen tests, the engine eleven plus one ignored. CI runs all of them on every push, the secure run included.
+
+- **Comparison circuit:** a random-vector comparison across all 16 slots, and a sixteen-edge-case comparison (equal operands, zero against one, the largest legal operand against zero and against itself, neighbours one apart) that also pins the noise left after the circuit.
+- **Packed primitives:** mask, prefix sum and broadcast total each checked against plaintext, and one test that runs prefix, broadcast and comparison together and pins that noise too.
+- **Ranged comparison:** tables checked at every interpolation point, both evaluators exhaustive on all 576 pairs below 24, agreement with the full circuit on random inputs below 4,096, and the shipped tables loaded and exercised.
+- **Roles:** public-key ciphertexts decrypt under the secret and cost only a few bits more, a comparison on them fits the budget, all four orderings of party pairs reconstruct a reference decryption, and one party alone does not.
+- **Collective key generation:** as listed in its section.
+- **Engine:** every book in both modes, pinning five numbers each: units matched, the smaller side's total, comparisons made, quantities decrypted, orders left unfilled. A change to the circuit, either matcher, or the decryption accounting shows up as a diff in one of those. The ignored test is the small-lots book at n = 2^15, about 21 s on eleven threads: `cargo test --release -- --ignored`.
 
 ## What the engine does
 
@@ -98,7 +105,7 @@ This corrects an earlier plan. The digit-decomposition trick in Iliashenko and Z
 What was measured at that degree, on eleven threads:
 
 - The full-domain circuit takes 148 s and decrypts wrong: 583 bits of noise in a modulus of about 600. It does not fit. The ranged circuit at R = 4,096 is correct in 6.3 s with 470 bits, so at secure parameters the range-sized circuit is not only faster, it is the one that works.
-- The whole `books/small-lots.json` run: 16 s, 2.2 GB peak, 2780 of 2780 matched with the boundary order partial at 135, pinned by the ignored test.
+- The whole `books/small-lots.json` run: 21 s, 2.2 GB peak, 2780 of 2780 matched with the boundary order partial at 135, pinned by the ignored test. Of that, collective key generation is about 4 s and threshold decryption about 2 s.
 - Parallelism: the giant-step blocks were independent up to the final sum and now run on rayon, and the power ladders are built by doubling so each level's multiplications run in parallel at the same depth. Single-threaded the ranged comparison took 26 s at n = 2^15. At the toy degree the same change takes the ETH/USDC walk from 0.75 s to 0.22 s.
 
 What is not done: modulus switching. Dropping primes as depth is consumed would make the later ladder levels and the block products cheaper, perhaps 20 to 30 percent of the comparison. It also means a level on every ciphertext and relinearization keys per level, which touches every call site. Not worth that at this stage, and the number to beat is written down here so the next person can decide.
@@ -110,7 +117,7 @@ Three crates, wired together by path dependencies:
 | Crate | Path | Role |
 | --- | --- | --- |
 | `order-match-engine` | `order-match-engine/` | Binary. Loads a book, runs the matching flow above, counts what it decrypts. |
-| `operators` | `caird/operators/` | Homomorphic comparison: `univariate_less_than`, `powers_of_x`, an encrypted `sort`, the coefficient precomputation `compute_lt_coefficients`, and the `packed` module (mask, prefix sum, broadcast total by rotation). |
+| `operators` | `caird/operators/` | The comparison circuits (`univariate_less_than`, `ranged`), the power ladder, the coefficient precomputation, an encrypted `sort` the engine does not use, and three modules the engine is built on: `packed` (mask, prefix sum, broadcast total by rotation), `roles` (public key, 2-of-3 shares, threshold decryption), `dkg` (collective key generation). |
 | `bfv` | `bfv/bfv/` | The BFV scheme itself: RNS polynomial arithmetic, NTT (via `concrete-ntt`, optional Intel HEXL), encryption, relinearization, hybrid key switching. Vendored from Janmajaya Mall's `bfv` library (MIT license in `bfv/LICENSE`), plus 39 added lines: constructors so collectively generated keys can be handed to it. |
 
 ```mermaid
@@ -119,7 +126,7 @@ flowchart TD
         A[order.json] --> B[Parse buy and sell quantities]
     end
 
-    B --> C["Encode each quantity into slot 0<br/>and encrypt under the secret key"]
+    B --> C["Encode each quantity into slot 0<br/>and encrypt under the public key"]
 
     subgraph E["Encrypted domain (BFV)"]
         C --> D1["Homomorphic sum of buy orders"]
@@ -151,16 +158,16 @@ Every decision the engine makes crosses the boundary out of the encrypted domain
 **Parameters** (set in `order-match-engine/src/main.rs`):
 
 - Plaintext modulus t = 65537, a Fermat prime, so plaintext slots form Z_65537 and Fermat's little theorem applies with exponent 65536.
-- Ring degree n = 16, so 16 SIMD slots. This is a toy dimension, see Limitations.
+- Ring degree n = 16 by default, so 16 SIMD slots, which is a toy dimension, see Limitations. `--secure` uses n = 2^15.
 - Ciphertext modulus Q: ten 60-bit primes, about 600 bits total, plus a 180-bit extension modulus P for hybrid key switching.
-- The library is symmetric-key only. The public key submitters encrypt under, and the 2-of-3 split decryptors hold, are built in `operators::roles` from the ring operations the library exposes. See [Three roles](#three-roles-operatorsroles).
+- The library is symmetric-key only. The public key submitters encrypt under and the 2-of-3 shares decryptors hold are defined in `operators::roles` and generated collectively in `operators::dkg`, from the ring operations the library exposes. See [Three roles](#three-roles-operatorsroles) and [Collective key generation](#collective-key-generation-operatorsdkg).
 
 **What runs homomorphically:**
 
 - Additions and subtractions of ciphertexts (order sums, the running remainder).
 - The less-than comparison, `univariate_less_than` in `caird/operators/src/lib.rs`. It computes z = x minus y, then evaluates the univariate sign-extraction polynomial over Z_t: the result is (t+1)/2 times z^(t-1) plus z times g(z^2), where g has degree (t-3)/2 and coefficients alpha_i equal to the sum of a^(t-1-i) for a from 1 to (t-1)/2. This is the univariate comparison construction of Iliashenko and Zucca ("Faster homomorphic comparison operations for BFV and TFHE"). The output ciphertext holds 1 in each slot where x < y and 0 otherwise, correct for inputs below t/2.
 - The 32768 polynomial coefficients are precomputed by `compute_lt_coefficients`, shipped as `order-match-engine/data/less_than.bin` (262144 bytes of little-endian u64), and embedded into the operators crate at build time with `include_bytes!`, so there is no data directory to find at run time.
-- Evaluation uses a baby-step giant-step split: powers z^2 through (z^2)^181 and ((z^2)^181)^1 through ((z^2)^181)^181, computed with a binary-exponentiation power ladder (`powers_of_x`) plus relinearization, then 182 blocks of 181 plaintext-multiply-and-accumulate steps.
+- Evaluation uses a baby-step giant-step split: powers z^2 through (z^2)^181 and ((z^2)^181)^1 through ((z^2)^181)^181, built by doubling in `powers_of_x` with a relinearization per multiply and each level's multiplies in parallel, then 182 blocks of 181 plaintext-multiply-and-accumulate steps, also in parallel, summed once.
 - `operators` also contains an encrypted `sort` that builds a Hamming-weight matrix from pairwise comparisons and extracts ranked elements with an equality-test polynomial. The matching engine does not call it, and its test is commented out.
 
 **What is decrypted, and when.** Two kinds of values leave the encrypted domain during a run, and the binary counts both:
@@ -168,7 +175,7 @@ Every decision the engine makes crosses the boundary out of the encrypted domain
 1. One comparison bit per decision: first buy-sum versus sell-sum, then one per order on the larger side. Each is decrypted immediately so plaintext control flow can branch on it.
 2. The quantity of every order that filled, for the report. On the sample book that is seven bits and nine quantities. Neither side total is decrypted as a ciphertext, though the smaller side's total is the sum of its decrypted fills. An unfilled order's quantity is never decrypted.
 
-**Who holds what.** The comparison and packing operators take only the evaluation key. Nothing in them can decrypt. The engine holds a public key, an evaluation key and three shares, and a secret key exists only inside the dealer function during setup and in the unit tests. Every decryption is a partial from two of the three shares, combined.
+**Who holds what.** The comparison and packing operators take only the evaluation key. Nothing in them can decrypt. The engine holds a public key, an evaluation key and three shares. No secret key exists at any point in a run, since the keys come from three parties running the collective protocols, and a secret key appears only in unit tests. Every decryption is a partial from two of the three shares, combined.
 
 ## What is encrypted and what is revealed
 
@@ -209,7 +216,6 @@ The vendored library was edited for this, for the first time: five constructors 
 
 What is still one process: the three roles are separated by keys rather than machines, and the parties must agree on the seed for the common random string, which in practice comes from a beacon or a hash of commitments. Separate machines need ciphertexts on the wire, and the library's `serialize` feature depends on `prost-build`, which needs `protoc` at build time, so that is a build-environment decision before it is a code one.
 
-
 ## Measured performance
 
 Measured on an Apple Silicon Mac (arm64), `--release`, at the toy ring degree n = 16:
@@ -219,7 +225,7 @@ Measured on an Apple Silicon Mac (arm64), `--release`, at the toy ring degree n 
 - `books/small-lots.json`, walk (9 comparisons): about 0.17 s. Packed (4 comparisons on the 4,096 table): about 0.04 s. With `--secure`: about 21 s, of which collective key generation is about 4 s and threshold decryption about 2 s.
 - `less_than_works` test (one comparison on fresh ciphertexts, all 16 slots at once): about 0.11 s including key generation.
 
-These numbers do not transfer to secure parameters. Every polynomial operation scales at least with n log n, and a secure ring degree for a 600-bit modulus is three orders of magnitude larger than 16.
+These numbers do not transfer to secure parameters, since every polynomial operation scales at least with n log n. What n = 2^15 actually costs is in [Secure parameters](#secure-parameters---secure).
 
 ## Limitations
 
@@ -237,10 +243,10 @@ These numbers do not transfer to secure parameters. Every polynomial operation s
 
 ```
 order-match-engine/   binary crate: both matchers, order.json, books/, data/ (full and ranged comparison tables)
-caird/operators/      comparison and sorting circuits over BFV ciphertexts
+caird/operators/      comparison circuits, packed primitives, roles, collective key generation
 bfv/                  vendored BFV library (workspace: bfv, traits), MIT licensed
 ```
 
 ## Credits
 
-The `bfv` library and the comparison operator implementation build on work by Janmajaya Mall (`bfv/LICENSE`, MIT, 2023). The comparison polynomial follows Iliashenko and Zucca, "Faster homomorphic comparison operations for BFV and TFHE", PoPETs 2021.
+The `bfv` library and the comparison operator implementation build on work by Janmajaya Mall (`bfv/LICENSE`, MIT, 2023). The comparison polynomial follows Iliashenko and Zucca, "Faster homomorphic comparison operations for BFV and TFHE", PoPETs 2021. The collective key generation follows Mouchet, Troncoso-Pastoriza, Bossuat and Hubaux, "Multiparty Homomorphic Encryption from Ring-Learning-with-Errors", PoPETs 2021, and the smudging is from Asharov et al., "Multiparty Computation with Low Communication, Computation and Interaction via Threshold FHE", EUROCRYPT 2012.
